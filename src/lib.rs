@@ -101,7 +101,7 @@ pub enum Error {
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -480,7 +480,7 @@ impl Filter {
     /// Current error ratio at the current occupancy.
     pub fn current_error_ratio(&self) -> f64 {
         let occupancy = self.len as f64 / self.total_buckets().get() as f64;
-        1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits.get() as i32) as f64)
+        1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits.get() as i32))
     }
 
     #[inline]
@@ -1153,8 +1153,8 @@ impl Filter {
 
     #[inline]
     fn calc_qr(&self, hash: u64) -> (u64, u64) {
-        let hash_bucket_idx = (hash >> self.rbits.get()) as u64 & ((1 << self.qbits.get()) - 1);
-        let remainder = (hash as u64) & ((1 << self.rbits.get()) - 1);
+        let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
+        let remainder = hash & ((1 << self.rbits.get()) - 1);
         (hash_bucket_idx, remainder)
     }
 
