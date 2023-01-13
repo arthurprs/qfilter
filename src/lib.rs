@@ -1111,10 +1111,7 @@ impl Filter {
                 self.set_runend(insert_idx.wrapping_sub(1) % self.total_buckets(), false);
                 self.set_runend(insert_idx, true);
             }
-            Operation::BeforeRunend => {
-                /* there are larger remainders already in the run. */
-                // self.set_runend(insert_idx, false);
-            }
+            Operation::BeforeRunend => { /* there are larger remainders already in the run. */ }
         }
 
         self.adjust_offsets::<true>(hash_bucket_idx, empty_slot_idx);
