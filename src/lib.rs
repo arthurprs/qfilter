@@ -80,7 +80,7 @@ use stable_hasher::StableHasher;
 mod stable_hasher;
 
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Filter {
     #[serde(rename = "b", with = "serde_bytes")]
     buffer: Vec<u8>,
@@ -159,11 +159,6 @@ impl BitExt for u64 {
         let b_shifted = ((b_shifted_mask & b) << bits) & b_shifted_mask;
         let b_mask = !b_shifted_mask;
 
-        // dbg!(bits, b_end, b_start);
-        // println!("a_component       {:064b}", a_component);
-        // println!("b_shifted_mask    {:064b}", b_shifted_mask);
-        // println!("b_shifted         {:064b}", b_shifted);
-        // println!(" (b & b_mask)     {:064b}", (b & b_mask));
         a_component | b_shifted | (b & b_mask)
     }
 
@@ -175,10 +170,6 @@ impl BitExt for u64 {
         let b_shifted = ((b_shifted_mask & b) >> bits) & b_shifted_mask;
         let b_mask = !b_shifted_mask;
 
-        // println!("a_component       {:064b}", a_component);
-        // println!("b_shifted_mask    {:064b}", b_shifted_mask);
-        // println!("b_shifted         {:064b}", b_shifted);
-        // println!("(b & b_mask)      {:064b}", (b & b_mask));
         a_component | b_shifted | (b & b_mask)
     }
 
@@ -1210,7 +1201,19 @@ impl Filter {
             }
             println!("");
         }
-        eprintln!("===")
+        eprintln!("===");
+    }
+}
+
+impl std::fmt::Debug for Filter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filter")
+            .field("buffer", &"[..]")
+            .field("len", &self.len)
+            .field("qbits", &self.qbits)
+            .field("rbits", &self.rbits)
+            .field("max_qbits", &self.max_qbits)
+            .finish()
     }
 }
 
