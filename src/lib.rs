@@ -387,7 +387,9 @@ impl Filter {
             .trailing_zeros() as u8;
         let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap());
-        result.max_qbits = Some(max_qbits.try_into().unwrap());
+        if max_qbits > qbits {
+            result.max_qbits = Some(max_qbits.try_into().unwrap());
+        }
         result
     }
 
@@ -449,6 +451,8 @@ impl Filter {
     #[inline]
     pub fn capacity(&self) -> u64 {
         if cfg!(fuzzing) {
+            // 100% occupancy is not realistic but stresses the algorithm much more.
+            // To generate real counter examples this "pessimisation" must be removed.
             self.total_buckets().get()
         } else {
             // Up to 95% occupancy
@@ -537,14 +541,60 @@ impl Filter {
         }
     }
 
-    fn adjust_offsets<const INC: bool>(&mut self, start_bucket: u64, end_bucket: u64) {
+    #[inline]
+    fn inc_offsets(&mut self, start_bucket: u64, end_bucket: u64) {
         let original_block = start_bucket / 64;
         let mut last_affected_block = end_bucket / 64;
         if end_bucket < start_bucket {
             last_affected_block += self.total_blocks().get();
         }
         for b in original_block + 1..=last_affected_block {
-            self.adjust_block_offset(b, INC);
+            self.adjust_block_offset(b, true);
+        }
+    }
+
+    #[inline]
+    fn dec_offsets(&mut self, start_bucket: u64, end_bucket: u64) {
+        let original_block = start_bucket / 64;
+        let mut last_affected_block = end_bucket / 64;
+        if end_bucket < start_bucket {
+            last_affected_block += self.total_blocks().get();
+        }
+
+        // As an edge case we may decrement the offsets of 2+ blocks and the block B' offset
+        // may be saturated and depend on a previous Block B" with a non saturated offset.
+        // But B" offset may also(!) be affected by the decremented operation, so we must
+        // decrement B" offset first before the remaining offsets.
+        if last_affected_block > original_block + 1 // 2+ blocks check
+            && self.raw_block(original_block + 1).offset >= u8::MAX as u64
+        {
+            // last affected block offset is always <= 64 (BLOCK SIZE)
+            // otherwise the decrement operation would be to affecting a subsequent block
+            debug_assert!(self.raw_block(last_affected_block).offset <= 64);
+            self.adjust_block_offset(last_affected_block, false);
+            last_affected_block -= 1;
+        }
+        for b in original_block + 1..=last_affected_block {
+            self.adjust_block_offset(b, false);
+        }
+
+        #[cfg(fuzzing)]
+        self.validate_offsets(original_block, last_affected_block);
+    }
+
+    #[cfg(any(fuzzing, test))]
+    fn validate_offsets(&mut self, original_block: u64, last_affected_block: u64) {
+        for b in original_block..=last_affected_block {
+            let raw_offset = self.raw_block(b).offset;
+            let offset = self.calc_offset(b);
+            debug_assert!(
+                (raw_offset >= u8::MAX as u64 && offset >= u8::MAX as u64)
+                    || (offset == raw_offset),
+                "block {} offset {} calc {}",
+                b,
+                raw_offset,
+                offset,
+            );
         }
     }
 
@@ -774,8 +824,7 @@ impl Filter {
     #[cold]
     #[inline(never)]
     fn calc_offset(&self, block_num: u64) -> u64 {
-        // if offset overflew we can figure out the offset by searching for the runend
-        // of the last bucket of the the prev block.
+        // The block offset can be calculated as the difference between its position and runstart.
         let block_start = (block_num * 64) % self.total_buckets();
         let mut run_start = self.run_start(block_start);
         if run_start < block_start {
@@ -787,6 +836,7 @@ impl Filter {
     /// Start idx of of the run (inclusive)
     #[inline]
     fn run_start(&self, hash_bucket_idx: u64) -> u64 {
+        // runstart is equivalent to the runend of the previous bucket + 1.
         let prev_bucket = hash_bucket_idx.wrapping_sub(1) % self.total_buckets();
         (self.run_end(prev_bucket) + 1) % self.total_buckets()
     }
@@ -991,7 +1041,7 @@ impl Filter {
         }
         self.set_runend(last_bucket_shifted_run_end, false);
         self.set_remainder(last_bucket_shifted_run_end, 0);
-        self.adjust_offsets::<false>(hash_bucket_idx, last_bucket_shifted_run_end);
+        self.dec_offsets(hash_bucket_idx, last_bucket_shifted_run_end);
         self.len -= 1;
         true
     }
@@ -1105,7 +1155,7 @@ impl Filter {
             Operation::BeforeRunend => { /* there are larger remainders already in the run. */ }
         }
 
-        self.adjust_offsets::<true>(hash_bucket_idx, empty_slot_idx);
+        self.inc_offsets(hash_bucket_idx, empty_slot_idx);
         self.len += 1;
         Ok(true)
     }
@@ -1502,18 +1552,22 @@ mod tests {
     }
 
     #[test]
-    fn it_works() {
-        let mut f = Filter::new(1000000, 0.01);
-        assert!(!f.contains(0));
-        assert_eq!(f.len(), 0);
-        for i in 0..f.capacity() {
-            f.insert_duplicated(i).unwrap();
+    fn test_it_works() {
+        for fp_rate_arg in [0.01, 0.001, 0.0001] {
+            let mut f = Filter::new(100_000, fp_rate_arg);
+            assert!(!f.contains(0));
+            assert_eq!(f.len(), 0);
+            for i in 0..f.capacity() {
+                f.insert_duplicated(i).unwrap();
+            }
+            for i in 0..f.capacity() {
+                assert!(f.contains(i));
+            }
+            let est_fp_rate =
+                (0..).take(50_000).filter(|i| f.contains(i)).count() as f64 / 50_000.0;
+            dbg!(f.max_error_ratio(), est_fp_rate);
+            assert!(est_fp_rate <= f.max_error_ratio());
         }
-        for i in 0..f.capacity() {
-            assert!(f.contains(i));
-        }
-        let est_fp_rate = (1000..).take(50_000).filter(|i| f.contains(i)).count() as f64 / 50_000.0;
-        dbg!(est_fp_rate);
     }
 
     #[test]
@@ -1540,5 +1594,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_dec_offset_edge_case() {
+        // case found in fuzz testing
+        #[rustfmt::skip]
+        let sample = [(0u16, 287), (2u16, 1), (9u16, 2), (10u16, 1), (53u16, 5), (61u16, 5), (127u16, 2), (232u16, 1), (255u16, 21), (314u16, 2), (317u16, 2), (384u16, 2), (511u16, 3), (512u16, 2), (1599u16, 2), (2303u16, 5), (2559u16, 2), (2568u16, 3), (2815u16, 2), (6400u16, 2), (9211u16, 2), (9728u16, 2), (10790u16, 1), (10794u16, 94), (10797u16, 2), (10999u16, 2), (11007u16, 2), (11520u16, 1), (12800u16, 4), (12842u16, 2), (13823u16, 1), (14984u16, 2), (15617u16, 2), (15871u16, 4), (16128u16, 3), (16383u16, 2), (16394u16, 1), (18167u16, 2), (23807u16, 1), (32759u16, 2) ];
+        let mut f = Filter::new(400, 0.1);
+        for (i, c) in sample {
+            for _ in 0..c {
+                f.insert_duplicated(i).unwrap();
+            }
+        }
+        assert_eq!(f.raw_block(2).offset, 3);
+        assert_eq!(f.raw_block(3).offset, u8::MAX as u64);
+        f.validate_offsets(0, f.total_buckets().get());
+        f.remove(0u16);
+        assert_eq!(f.raw_block(2).offset, 2);
+        assert_eq!(f.raw_block(3).offset, 254);
+        f.validate_offsets(0, f.total_buckets().get());
     }
 }
