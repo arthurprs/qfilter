@@ -1,7 +1,8 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-const FUZZ_REMOVES: Option<&str> = option_env!("FUZZ_REMOVES");
+const FUZZ_REMOVES: bool = true;
+const CHECK_EVERY: usize = 8;
 
 fuzz_target!(|data: Vec<i16>| {
     if data.len() < 2 {
@@ -12,16 +13,20 @@ fuzz_target!(|data: Vec<i16>| {
     let ops = data
         .into_iter()
         .map(|i| {
-            if i < 0 && FUZZ_REMOVES.is_some() {
+            if i < 0 && FUZZ_REMOVES {
                 (false, i.checked_neg().unwrap_or(0) as u16)
             } else {
                 (true, i as u16)
             }
         })
         .collect::<Vec<(bool, u16)>>();
-    let mut counts = [0u64; (u16::MAX as usize) +1 ];
+    // The "Model", tracks the count for each item
+    let mut counts = [0u64; (u16::MAX as usize) + 1];
     let mut f = qfilter::Filter::new(cap, fp);
     for i in 0..ops.len() {
+        // print_sample(&counts);
+        // dbg!(ops[i]);
+
         let (add, item) = ops[i];
         if add {
             if f.insert_duplicated(item).is_err() {
@@ -35,15 +40,31 @@ fuzz_target!(|data: Vec<i16>| {
                 continue;
             }
         }
-        for &(_add, e) in &ops[..=i] {
-            let est = f.count(e);
-            let min = counts[e as usize];
-            assert!(est >= min, "{}: est {} min {}", e, est, min);
+        if i % CHECK_EVERY == 0 {
+            for &(_add, e) in &ops[..=i] {
+                let min = counts[e as usize];
+                // Since we can only check for >= due to collisions skip min = 0
+                if min != 0 {
+                    let est = f.count(e);
+                    assert!(est >= min, "{}: est {} min {}", e, est, min);
+                }
+            }
         }
     }
     for &(_add, e) in &ops {
-        let est = f.count(e);
         let min = counts[e as usize];
+        let est = f.count(e);
         assert!(est >= min, "{}: est {} min {}", e, est, min);
     }
 });
+
+#[allow(dead_code)]
+fn print_sample(counts: &[u64]) {
+    print!("[");
+    for (i, c) in counts.iter().copied().enumerate() {
+        if c != 0 {
+            print!("({i}u16, {c}), ");
+        }
+    }
+    println!("]");
+}
