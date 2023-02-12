@@ -74,23 +74,28 @@ use std::{
     ops::{RangeBounds, RangeFrom},
 };
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use stable_hasher::StableHasher;
 
 mod stable_hasher;
 
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Filter {
-    #[serde(rename = "b", with = "serde_bytes")]
+    #[cfg_attr(feature = "serde", serde(rename = "b", with = "serde_bytes"))]
     buffer: Vec<u8>,
-    #[serde(rename = "l")]
+    #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
-    #[serde(rename = "q")]
+    #[cfg_attr(feature = "serde", serde(rename = "q"))]
     qbits: NonZeroU8,
-    #[serde(rename = "r")]
+    #[cfg_attr(feature = "serde", serde(rename = "r"))]
     rbits: NonZeroU8,
-    #[serde(rename = "g", skip_serializing_if = "Option::is_none", default)]
+    #[cfg_attr(
+        feature = "serde",
+        serde(rename = "g", skip_serializing_if = "Option::is_none", default)
+    )]
     max_qbits: Option<NonZeroU8>,
 }
 
@@ -1570,6 +1575,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn test_serde() {
         for capacity in [100, 1000, 10000] {
