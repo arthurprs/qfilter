@@ -77,7 +77,7 @@ For a given capacity and error probability the RSQF may require significantly le
 ### Legacy x86_64 CPUs support
 
 The implementation assumes the `popcnt` instruction (equivalent to `integer.count_ones()`) is present
-when compiling for x86_64 targets. This is theoretically not guaranteed as the instruction in only
+when compiling for x86_64 targets. This is theoretically not guaranteed as the instruction is only
 available on AMD/Intel CPUs released after 2007/2008. If that's not the case the Filter constructor will panic.
 
 Support for such legacy x86_64 CPUs can be optionally enabled with the `legacy_x86_64_support`
