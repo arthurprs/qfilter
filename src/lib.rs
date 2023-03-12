@@ -363,7 +363,11 @@ impl Iterator for HashesIter<'_> {
 
 impl Filter {
     /// Creates a new filter that can hold at least `capacity` items
-    /// and with a desired error rate of `fp_rate` (between 0 and 1).
+    /// and with a desired error rate of `fp_rate` (clamped to (0, 0.5]).
+    ///
+    /// # Panics
+    /// Panics if memory cannot be allocated or if capacity >= u64::MAX / 20.
+    /// Panics if the capacity and false positive rate isn't achievable using 64 bit hashes.
     #[inline]
     pub fn new(capacity: u64, fp_rate: f64) -> Self {
         Self::new_resizeable(capacity, capacity, fp_rate)
@@ -371,22 +375,26 @@ impl Filter {
 
     /// Creates a new filter that can hold at least `initial_capacity` items initially
     /// and can resize to hold at least `max_capacity` when fully grown.
-    /// The desired error rate `fp_rate` (between 0 and 1) applies to the fully grown filter.
+    /// The desired error rate `fp_rate` (clamped to (0, 0.5]) applies to the fully grown filter.
     ///
     /// This works by storing fingerprints large enough to satisfy the maximum requirements,
     /// so smaller filters will actually have lower error rates, which will increase
     /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
     /// capacity its error rate also doubles.
+    ///
+    /// # Panics
+    /// Panics if memory cannot be allocated or if capacity >= u64::MAX / 20.
+    /// Panics if the max capacity and false positive rate isn't achievable using 64 bit hashes.
     pub fn new_resizeable(initial_capacity: u64, max_capacity: u64, fp_rate: f64) -> Self {
         assert!(max_capacity >= initial_capacity);
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
         // Calculate necessary slots to achieve capacity with up to 95% occupancy
         // 19/20 == 0.95
-        let qbits = (initial_capacity * 20 / 19)
+        let max_qbits = (max_capacity.checked_mul(20).expect("Capacity overflow") / 19)
             .next_power_of_two()
             .max(64)
             .trailing_zeros() as u8;
-        let max_qbits = (max_capacity * 20 / 19)
+        let qbits = (initial_capacity * 20 / 19)
             .next_power_of_two()
             .max(64)
             .trailing_zeros() as u8;
@@ -400,7 +408,10 @@ impl Filter {
 
     fn with_qr(qbits: NonZeroU8, rbits: NonZeroU8) -> Filter {
         Self::check_cpu_support();
-        assert!(qbits.get() + rbits.get() <= 64, "Overflow");
+        assert!(
+            qbits.get() + rbits.get() <= 64,
+            "Capacity + false positive rate overflows 64 bit hashes"
+        );
         let num_slots = 1 << qbits.get();
         let num_blocks = num_slots / 64;
         assert!(num_blocks != 0);
@@ -449,6 +460,7 @@ impl Filter {
     /// Maximum filter capacity.
     #[inline]
     pub fn capacity_resizeable(&self) -> u64 {
+        // Overflow is not possible here as it'd have overflowed in the constructor.
         (1 << self.max_qbits.unwrap_or(self.qbits).get()) * 19 / 20
     }
 
@@ -462,6 +474,7 @@ impl Filter {
         } else {
             // Up to 95% occupancy
             // 19/20 == 0.95
+            // Overflow is not possible here as it'd have overflowed in the constructor.
             self.total_buckets().get() * 19 / 20
         }
     }
@@ -1434,6 +1447,18 @@ mod tests {
         assert!(f.grow_if_possible().is_err());
         let mut f = Filter::new_resizeable(0, 100, 0.01);
         assert!(f.grow_if_possible().is_ok());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_new_capacity_overflow() {
+        Filter::new_resizeable(100, u64::MAX, 0.01);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_new_hash_overflow() {
+        Filter::new_resizeable(100, u64::MAX / 20, 0.01);
     }
 
     #[test]
