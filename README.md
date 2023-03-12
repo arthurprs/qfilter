@@ -71,7 +71,6 @@ For a given capacity and error probability the RSQF may require significantly le
 - [ ] Merging
 - [ ] Shrink to fit
 - [ ] Counting
-- [ ] Opt-in serde support via feature flag
 - [ ] Smoother resizing by chaining exponentially larger and more precise filters
 
 ### Legacy x86_64 CPUs support
