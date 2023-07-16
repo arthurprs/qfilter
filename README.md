@@ -1,10 +1,10 @@
 # Qfilter
 
-Approximate Membership Query Filter ([AMQ-Filter](https://en.wikipedia.org/wiki/Approximate_Membership_Query_Filter))
-based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
+Efficient bloom filter like datastructure, based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
 
-This is a small and flexible general-purpose AMQ-Filter, it not only supports approximate membership testing like a bloom filter
-but also deletions, merging (not implemented), resizing and [serde](https://crates.io/crates/serde) serialization.
+This is a small and flexible general-purpose [AMQ-Filter](https://en.wikipedia.org/wiki/Approximate_Membership_Query_Filter).
+It not only supports approximate membership testing like a bloom filter but also deletions, merging (not implemented),
+resizing and [serde](https://crates.io/crates/serde) serialization.
 
 * High performance
 * Supports removals
