@@ -74,6 +74,8 @@ use std::{
     ops::{RangeBounds, RangeFrom},
 };
 
+#[cfg(feature = "jsonschema")]
+use schemars::JsonSchema;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use stable_hasher::StableHasher;
@@ -83,8 +85,16 @@ mod stable_hasher;
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
 pub struct Filter {
-    #[cfg_attr(feature = "serde", serde(rename = "b", with = "serde_bytes"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            rename = "b",
+            serialize_with = "serde_bytes::serialize",
+            deserialize_with = "serde_bytes::deserialize"
+        )
+    )]
     buffer: Vec<u8>,
     #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
