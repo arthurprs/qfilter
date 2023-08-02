@@ -1,6 +1,6 @@
 [package]
 name = "qfilter"
-version = "0.1.5"
+version = "0.1.6"
 description = "Efficient bloom filter like datastructure, based on the Rank Select Quotient Filter (RSQF)"
 repository = "https://github.com/arthurprs/qfilter"
 authors = ["Arthur Silva <arthurprs@gmail.com>"]
