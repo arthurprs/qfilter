@@ -10,35 +10,33 @@ const CHECK_SHRUNK: bool = true;
 #[derive(Debug, Arbitrary)]
 struct Input {
     cap: u16,
-    max_cap: u16,
-    fp_exp: u16,
+    fp_size: u8,
     ops: Vec<(bool, u16)>,
 }
 
 fuzz_target!(|input: Input| {
     let Input {
         cap,
-        max_cap,
-        fp_exp,
         ops,
+        fp_size,
     } = input;
-    let max_cap = max_cap.max(cap) as u64;
-    let cap = cap as u64;
-    let fp = 2f64.powi(-(fp_exp.leading_ones() as i32));
     // The "Model", tracks the count for each item
     let mut counts = [0u64; (u16::MAX as usize) + 1];
-    let mut f = qfilter::Filter::new_resizeable(cap, max_cap, fp).unwrap();
+    let Ok(mut f) = qfilter::Filter::with_fingerprint_size(cap as u64, fp_size.clamp(7, 64)) else {
+        return;
+    };
     for i in 0..ops.len() {
         // print_sample(&counts);
         // dbg!(ops[i]);
 
         let (add, item) = ops[i];
+        let item = item as u64;
         if !FUZZ_REMOVES || add {
-            if f.insert_duplicated(item).is_err() {
+            if f.insert_fingerprint(true, item).is_err() {
                 continue;
             }
             counts[item as usize] += 1;
-        } else if counts[item as usize] != 0 && f.remove(item) {
+        } else if counts[item as usize] != 0 && f.remove_fingerprint(item) {
             counts[item as usize] -= 1;
         } else {
             continue;
@@ -49,7 +47,7 @@ fuzz_target!(|input: Input| {
                 let min = counts[e as usize];
                 // Since we can only check for >= due to collisions skip min = 0
                 if min != 0 {
-                    let est = f.count(e);
+                    let est = f.count_fingerprint(e as u64);
                     assert!(est >= min, "{e}: est {est} < min {min}");
                 }
             }
@@ -59,7 +57,7 @@ fuzz_target!(|input: Input| {
     for shrunk in [false, true] {
         for &(_add, e) in &ops {
             let min = counts[e as usize];
-            let est = f.count(e);
+            let est = f.count_fingerprint(e as u64);
             assert!(est >= min, "{e}: est {est} < min {min} shrunk {shrunk:?}");
         }
         if !CHECK_SHRUNK {
