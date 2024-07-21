@@ -25,38 +25,24 @@
 //!
 //! For a given capacity and error probability the RSQF may require significantly less space than the equivalent bloom filter or other AMQ-Filters.
 //!
-//! | Bits per item | Error probability when full |
-//! |--------|----------|
-//! | 3.125  | 0.362    |
-//! | 4.125  | 0.201    |
-//! | 5.125  | 0.106    |
-//! | 6.125  | 0.0547   |
-//! | 7.125  | 0.0277   |
-//! | 8.125  | 0.014    |
-//! | 9.125  | 0.00701  |
-//! | 10.125 | 0.00351  |
-//! | 11.125 | 0.00176  |
-//! | 12.125 | 0.000879 |
-//! | 13.125 | 0.000439 |
-//! | 14.125 | 0.00022  |
-//! | 15.125 | 0.00011  |
-//! | 16.125 | 5.49e-05 |
-//! | 17.125 | 2.75e-05 |
-//! | 18.125 | 1.37e-05 |
-//! | 19.125 | 6.87e-06 |
-//! | 20.125 | 3.43e-06 |
-//! | 21.125 | 1.72e-06 |
-//! | 22.125 | 8.58e-07 |
-//! | 23.125 | 4.29e-07 |
-//! | 24.125 | 2.15e-07 |
-//! | 25.125 | 1.07e-07 |
-//! | 26.125 | 5.36e-08 |
-//! | 27.125 | 2.68e-08 |
-//! | 28.125 | 1.34e-08 |
-//! | 29.125 | 6.71e-09 |
-//! | 30.125 | 3.35e-09 |
-//! | 31.125 | 1.68e-09 |
-//! | 32.125 | 8.38e-10 |
+//! | Bits per item | Error probability when full | Bits per item (Cont.) | Error (cont.) |
+//! |:---:|:---:|:---:|---|
+//! | 3.125 | 0.362 | 19.125 | 6.87e-06 |
+//! | 4.125 | 0.201 | 20.125 | 3.43e-06 |
+//! | 5.125 | 0.106 | 21.125 | 1.72e-06 |
+//! | 6.125 | 0.0547 | 22.125 | 8.58e-07 |
+//! | 7.125 | 0.0277 | 23.125 | 4.29e-07 |
+//! | 8.125 | 0.014 | 24.125 | 2.15e-07 |
+//! | 9.125 | 0.00701 | 25.125 | 1.07e-07 |
+//! | 10.125 | 0.00351 | 26.125 | 5.36e-08 |
+//! | 11.125 | 0.00176 | 27.125 | 2.68e-08 |
+//! | 12.125 | 0.000879 | 28.125 | 1.34e-08 |
+//! | 13.125 | 0.000439 | 29.125 | 6.71e-09 |
+//! | 14.125 | 0.00022 | 30.125 | 3.35e-09 |
+//! | 15.125 | 0.00011 | 31.125 | 1.68e-09 |
+//! | 16.125 | 5.49e-05 | 32.125 | 8.38e-10 |
+//! | 17.125 | 2.75e-05 | .. | .. |
+//! | 18.125 | 1.37e-05 | .. | .. |
 //!
 //! ### Legacy x86_64 CPUs support
 //!
@@ -83,6 +69,16 @@ use stable_hasher::StableHasher;
 mod stable_hasher;
 
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
+///
+/// This data structure is similar to a hash table that stores fingerprints in a very compact way.
+/// Fingerprints are similar to a hash values, but are possibly truncated.
+/// The reason for false positives is that multiple items can map to the same fingerprint.
+/// For more information see the [quotient filter Wikipedia page](https://en.wikipedia.org/wiki/Quotient_filter)
+/// that describes a similar but less optimized version of the data structure.
+/// The actual implementation is based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
+///
+/// The public API also exposes a fingerprint API, which can be used to succinctly store u64
+/// hash values.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
@@ -110,8 +106,12 @@ pub struct Filter {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
+    /// The filter cannot fit another fingerprint
     CapacityExceeded,
+    /// The fingerprint sizes are not compatible
+    IncompatibleFingerprintSize,
 }
 
 impl std::fmt::Display for Error {
@@ -320,22 +320,23 @@ impl CastNonZeroU8 for NonZeroU8 {
     }
 }
 
-struct HashesIter<'a> {
+/// An iterator over the fingerprints of a `Filter`.
+pub struct FingerprintIter<'a> {
     filter: &'a Filter,
     q_bucket_idx: u64,
     r_bucket_idx: u64,
     remaining: u64,
 }
 
-impl<'a> HashesIter<'a> {
-    fn new(filter: &'a Filter) -> Self {
-        let mut iter = HashesIter {
+impl<'a> FingerprintIter<'a> {
+    fn new(filter: &'a Filter, ordered: bool) -> Self {
+        let mut iter = FingerprintIter {
             filter,
             q_bucket_idx: 0,
             r_bucket_idx: 0,
             remaining: filter.len,
         };
-        if !filter.is_empty() {
+        if ordered && !filter.is_empty() {
             while !filter.is_occupied(iter.q_bucket_idx) {
                 iter.q_bucket_idx += 1;
             }
@@ -345,7 +346,7 @@ impl<'a> HashesIter<'a> {
     }
 }
 
-impl Iterator for HashesIter<'_> {
+impl Iterator for FingerprintIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -416,15 +417,44 @@ impl Filter {
         result
     }
 
+    /// Creates a new filter that can hold at least `initial_capacity` items initially while
+    /// utilizing a fingerprint bit size of `fingerprint_bits` (7..=64).
+    ///
+    /// This works by storing fingerprints large enough to satisfy the maximum requirements,
+    /// so smaller filters will actually have lower error rates, which will increase
+    /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
+    /// capacity its error rate also doubles.
+    ///
+    /// # Panics
+    /// Panics if `fingerprint_bits` isn't part of the range `7..=64`.
+    /// Panics if memory cannot be allocated.
+    pub fn with_fingerprint_size(capacity: u64, fingerprint_bits: u8) -> Self {
+        assert!((7..=64).contains(&fingerprint_bits));
+        let qbits = (capacity.checked_mul(20).expect("Capacity overflow") / 19)
+            .next_power_of_two()
+            .max(64)
+            .trailing_zeros() as u8;
+        assert!(
+            fingerprint_bits > qbits,
+            "Fingerprint size insufficient for initial capacity"
+        );
+        let rbits = fingerprint_bits - qbits;
+        let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap());
+        if rbits > 1 {
+            result.max_qbits = Some((qbits + rbits - 1).try_into().unwrap());
+        }
+        result
+    }
+
     fn with_qr(qbits: NonZeroU8, rbits: NonZeroU8) -> Filter {
         Self::check_cpu_support();
         assert!(
             qbits.get() + rbits.get() <= 64,
-            "Capacity + false positive rate overflows 64 bit hashes"
+            "Required fingerprint size is greater than 64 bits"
         );
         let num_slots = 1 << qbits.get();
         let num_blocks = num_slots / 64;
-        assert!(num_blocks != 0);
+        assert_ne!(num_blocks, 0);
         let block_bytes_size = 1 + 16 + 64 * rbits.u64() / 8;
         let buffer_bytes = num_blocks * block_bytes_size;
         let buffer = vec![0u8; buffer_bytes.try_into().unwrap()];
@@ -449,13 +479,19 @@ impl Filter {
         );
     }
 
+    /// The internal fingerprint size in bits.
+    #[inline]
+    pub fn fingerprint_size(&self) -> u8 {
+        self.qbits.get() + self.rbits.get()
+    }
+
     /// Whether the filter is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Current number of items admitted to the filter.
+    /// Current number of fingerprints admitted to the filter.
     #[inline]
     pub fn len(&self) -> u64 {
         self.len
@@ -593,7 +629,7 @@ impl Filter {
         // may be saturated and depend on a previous Block B" with a non saturated offset.
         // But B" offset may also(!) be affected by the decremented operation, so we must
         // decrement B" offset first before the remaining offsets.
-        if last_affected_block > original_block + 1 // 2+ blocks check
+        if last_affected_block - original_block >= 2
             && self.raw_block(original_block + 1).offset >= u8::MAX as u64
         {
             // last affected block offset is always <= 64 (BLOCK SIZE)
@@ -736,7 +772,7 @@ impl Filter {
 
     #[inline]
     fn get_rem_u64(&self, rem_u64: u64) -> u64 {
-        let rbits = NonZeroU64::try_from(self.rbits).unwrap();
+        let rbits = NonZeroU64::from(self.rbits);
         let bucket_block_idx = (rem_u64 / rbits) % self.total_blocks();
         let bucket_rem_u64 = (rem_u64 % rbits) as usize;
         let bucket_rem_start = (bucket_block_idx as usize * self.block_byte_size()) + 1 + 8 + 8;
@@ -749,7 +785,7 @@ impl Filter {
 
     #[inline]
     fn set_rem_u64(&mut self, rem_u64: u64, rem: u64) {
-        let rbits = NonZeroU64::try_from(self.rbits).unwrap();
+        let rbits = NonZeroU64::from(self.rbits);
         let bucket_block_idx = (rem_u64 / rbits) % self.total_blocks();
         let bucket_rem_u64 = (rem_u64 % rbits) as usize;
         let bucket_rem_start = (bucket_block_idx as usize * self.block_byte_size()) + 1 + 8 + 8;
@@ -926,16 +962,16 @@ impl Filter {
 
     /// Returns whether item is present (probabilistically) in the filter.
     pub fn contains<T: Hash>(&self, item: T) -> bool {
-        self.do_contains(self.hash(item))
+        self.contains_fingerprint(self.hash(item))
     }
 
-    fn do_contains(&self, hash: u64) -> bool {
+    /// Returns whether the fingerprint is present (probabilistically) in the filter.
+    pub fn contains_fingerprint(&self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return false;
         }
         let mut runstart_idx = self.run_start(hash_bucket_idx);
-        // dbg!(hash_bucket_idx, runstart_idx);
         loop {
             if hash_remainder == self.get_remainder(runstart_idx) {
                 return true;
@@ -947,10 +983,13 @@ impl Filter {
         }
     }
 
-    #[doc(hidden)]
-    #[cfg(any(fuzzing, test))]
+    /// Returns the number of times the item appears (probabilistically) in the filter.
     pub fn count<T: Hash>(&mut self, item: T) -> u64 {
-        let hash = self.hash(item);
+        self.count_fingerprint(self.hash(item))
+    }
+
+    /// Returns the amount of times the fingerprint appears (probabilistically) in the filter.
+    pub fn count_fingerprint(&mut self, hash: u64) -> u64 {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return 0;
@@ -1009,13 +1048,19 @@ impl Filter {
     /// Returns whether item was actually found and removed.
     ///
     /// Note that removing an item who wasn't previously added to the filter
-    /// may introduce false negatives. This is because it could be removing
+    /// may introduce **false negatives**. This is because it could be removing
     /// fingerprints from a colliding item!
     pub fn remove<T: Hash>(&mut self, item: T) -> bool {
-        self.do_remove(self.hash(item))
+        self.remove_fingerprint(self.hash(item))
     }
 
-    fn do_remove(&mut self, hash: u64) -> bool {
+    /// Removes the fingerprint specified by `hash` was from the filter.
+    /// Returns whether a fingerprint was actually found and removed.
+    ///
+    /// Note that removing a fingerprint that wasn't previously added to the filter
+    /// may introduce false negatives. This is because it could be removing
+    /// fingerprints from a colliding hash!
+    fn remove_fingerprint(&mut self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return false;
@@ -1079,33 +1124,42 @@ impl Filter {
     ///
     /// This function should be used when the filter is also subject to removals
     /// and the item is known to not have been added to the filter before (or was removed).
+    ///
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
         let hash = self.hash(item);
-        match self.do_insert(true, hash) {
+        match self.insert_fingerprint(true, hash) {
             Ok(_added) => Ok(()),
-            Err(Error::CapacityExceeded) => {
+            Err(_) => {
                 self.grow_if_possible()?;
-                self.do_insert(true, hash).map(|_| ())
+                self.insert_fingerprint(true, hash).map(|_| ())
             }
         }
     }
 
     /// Inserts `item` in the filter.
-    /// Returns ok(true) if the item was successfully added to the filter.
-    /// Returns ok(false) if the item is already contained (probabilistically) in the filter.
-    /// Returns an error if the filter cannot admit the new item.
+    ///
+    /// Returns `Ok(true)` if the item was successfully added to the filter.
+    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
         let hash = self.hash(item);
-        match self.do_insert(false, hash) {
+        match self.insert_fingerprint(false, hash) {
             Ok(added) => Ok(added),
             Err(_) => {
                 self.grow_if_possible()?;
-                self.do_insert(true, hash)
+                self.insert_fingerprint(true, hash)
             }
         }
     }
 
-    fn do_insert(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
+    /// Inserts the fingerprint specified by `hash` in the filter.
+    /// `duplicate` specifies if the fingerprint should be added even if it's already in the filter.
+    ///
+    /// Returns `Ok(true)` if the item was successfully added to the filter.
+    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    pub fn insert_fingerprint(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
         enum Operation {
             NewRun,
             BeforeRunend,
@@ -1188,6 +1242,53 @@ impl Filter {
         Ok(true)
     }
 
+    /// Returns an iterator over the fingerprints stored in the filter.
+    ///
+    /// If `ordered` is true the fingerprints will be returned in ascending order.
+    pub fn fingerprints(&self, ordered: bool) -> FingerprintIter {
+        FingerprintIter::new(self, ordered)
+    }
+
+    /// Shrinks the capacity of the finger as much as possible while preserving
+    /// the false positive ratios
+    pub fn shrink_to_fit(&mut self) {
+        if self.total_blocks().get() > 1 && self.len() <= self.capacity() / 2 {
+            let mut new = Self::with_qr(
+                (self.qbits.get() - 1).try_into().unwrap(),
+                (self.rbits.get() + 1).try_into().unwrap(),
+            );
+            new.max_qbits = self.max_qbits;
+            for hash in self.fingerprints(true) {
+                let _ = new.insert_fingerprint(true, hash);
+            }
+            assert_eq!(new.len, self.len);
+            *self = new;
+        }
+    }
+
+    /// Merges `other` filter into `self`.
+    ///
+    /// `keep_duplicates` defines whether duplicated fingerprints should be preserved,
+    /// this is only useful is the filter is being used for counting.
+    ///
+    /// Note that the `other` filter must have a fingerprint >= `self` fingerprint size,
+    /// otherwise the function will fail with `Err(Error::IncompatibleFingerprintSize)`.
+    /// This is already the case for filters created with the same parameters or if the `other`
+    /// filter has a lower target false positive ratio.
+    ///
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// Note that in this case items could have already been added and the filter is left
+    /// full but in an otherwise valid state.
+    pub fn merge(&mut self, keep_duplicates: bool, other: &Self) -> Result<(), Error> {
+        if other.fingerprint_size() < self.fingerprint_size() {
+            return Err(Error::IncompatibleFingerprintSize);
+        }
+        for hash in other.fingerprints(true) {
+            self.insert_fingerprint(keep_duplicates, hash)?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn grow_if_possible(&mut self) -> Result<(), Error> {
         if let Some(m) = self.max_qbits {
@@ -1206,8 +1307,8 @@ impl Filter {
         let rbits = NonZeroU8::new(self.rbits.get() - 1).unwrap();
         let mut new = Self::with_qr(qbits, rbits);
         new.max_qbits = self.max_qbits;
-        for hash in HashesIter::new(self) {
-            new.do_insert(true, hash).unwrap();
+        for hash in self.fingerprints(true) {
+            new.insert_fingerprint(true, hash).unwrap();
         }
         assert_eq!(self.len, new.len);
         *self = new;
@@ -1277,7 +1378,7 @@ impl Filter {
                 let r = self.get_remainder(b * 64 + i);
                 eprint!("{}", r % 10);
             }
-            println!("");
+            println!();
         }
         eprintln!("===");
     }
@@ -1641,7 +1742,7 @@ mod tests {
     fn test_dec_offset_edge_case() {
         // case found in fuzz testing
         #[rustfmt::skip]
-        let sample = [(0u16, 287), (2u16, 1), (9u16, 2), (10u16, 1), (53u16, 5), (61u16, 5), (127u16, 2), (232u16, 1), (255u16, 21), (314u16, 2), (317u16, 2), (384u16, 2), (511u16, 3), (512u16, 2), (1599u16, 2), (2303u16, 5), (2559u16, 2), (2568u16, 3), (2815u16, 2), (6400u16, 2), (9211u16, 2), (9728u16, 2), (10790u16, 1), (10794u16, 94), (10797u16, 2), (10999u16, 2), (11007u16, 2), (11520u16, 1), (12800u16, 4), (12842u16, 2), (13823u16, 1), (14984u16, 2), (15617u16, 2), (15871u16, 4), (16128u16, 3), (16383u16, 2), (16394u16, 1), (18167u16, 2), (23807u16, 1), (32759u16, 2) ];
+        let sample = [(0u16, 287), (2u16, 1), (9u16, 2), (10u16, 1), (53u16, 5), (61u16, 5), (127u16, 2), (232u16, 1), (255u16, 21), (314u16, 2), (317u16, 2), (384u16, 2), (511u16, 3), (512u16, 2), (1599u16, 2), (2303u16, 5), (2559u16, 2), (2568u16, 3), (2815u16, 2), (6400u16, 2), (9211u16, 2), (9728u16, 2), (10790u16, 1), (10794u16, 94), (10797u16, 2), (10999u16, 2), (11007u16, 2), (11520u16, 1), (12800u16, 4), (12842u16, 2), (13823u16, 1), (14984u16, 2), (15617u16, 2), (15871u16, 4), (16128u16, 3), (16383u16, 2), (16394u16, 1), (18167u16, 2), (23807u16, 1), (32759u16, 2)];
         let mut f = Filter::new(400, 0.1);
         for (i, c) in sample {
             for _ in 0..c {
