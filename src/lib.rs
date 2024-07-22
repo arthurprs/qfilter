@@ -334,14 +334,14 @@ pub struct FingerprintIter<'a> {
 }
 
 impl<'a> FingerprintIter<'a> {
-    fn new(filter: &'a Filter, ordered: bool) -> Self {
+    fn new(filter: &'a Filter) -> Self {
         let mut iter = FingerprintIter {
             filter,
             q_bucket_idx: 0,
             r_bucket_idx: 0,
             remaining: filter.len,
         };
-        if ordered && !filter.is_empty() {
+        if !filter.is_empty() {
             while !filter.is_occupied(iter.q_bucket_idx) {
                 iter.q_bucket_idx += 1;
             }
@@ -1248,13 +1248,13 @@ impl Filter {
 
     /// Returns an iterator over the fingerprints stored in the filter.
     ///
-    /// If `ordered` is true the fingerprints will be returned in ascending order.
-    pub fn fingerprints(&self, ordered: bool) -> FingerprintIter {
-        FingerprintIter::new(self, ordered)
+    /// Fingerprints will be returned in ascending order.
+    pub fn fingerprints(&self) -> FingerprintIter {
+        FingerprintIter::new(self)
     }
 
-    /// Shrinks the capacity of the finger as much as possible while preserving
-    /// the false positive ratios
+    /// Shrinks the capacity of the filter as much as possible while preserving
+    /// the false positive ratios and fingerprint size.
     pub fn shrink_to_fit(&mut self) {
         if self.total_blocks().get() > 1 && self.len() <= self.capacity() / 2 {
             let mut new = Self::with_qr(
@@ -1263,10 +1263,11 @@ impl Filter {
             )
             .unwrap();
             new.max_qbits = self.max_qbits;
-            for hash in self.fingerprints(true) {
+            for hash in self.fingerprints() {
                 let _ = new.insert_fingerprint(true, hash);
             }
-            assert_eq!(new.len, self.len);
+            debug_assert_eq!(new.len, self.len);
+            debug_assert_eq!(new.fingerprint_size(), self.fingerprint_size());
             *self = new;
         }
     }
@@ -1288,7 +1289,7 @@ impl Filter {
         if other.fingerprint_size() < self.fingerprint_size() {
             return Err(Error::IncompatibleFingerprintSize);
         }
-        for hash in other.fingerprints(true) {
+        for hash in other.fingerprints() {
             self.insert_fingerprint(keep_duplicates, hash)?;
         }
         Ok(())
@@ -1312,7 +1313,7 @@ impl Filter {
         let rbits = NonZeroU8::new(self.rbits.get() - 1).unwrap();
         let mut new = Self::with_qr(qbits, rbits).unwrap();
         new.max_qbits = self.max_qbits;
-        for hash in self.fingerprints(true) {
+        for hash in self.fingerprints() {
             new.insert_fingerprint(true, hash).unwrap();
         }
         assert_eq!(self.len, new.len);
@@ -1739,9 +1740,8 @@ mod tests {
             for h in fingerprints {
                 filter.insert_fingerprint(true, h).unwrap();
             }
-            let mut out = filter.fingerprints(true).collect::<Vec<_>>();
+            let out: Vec<u64> = filter.fingerprints().collect::<Vec<_>>();
             let mut expect = fingerprints.map(|h| h << (64 - fip_size) >> (64 - fip_size));
-            out.sort_unstable();
             expect.sort_unstable();
             assert_eq!(out, expect);
         }

@@ -15,11 +15,7 @@ struct Input {
 }
 
 fuzz_target!(|input: Input| {
-    let Input {
-        cap,
-        ops,
-        fp_size,
-    } = input;
+    let Input { cap, ops, fp_size } = input;
     // The "Model", tracks the count for each item
     let mut counts = [0u64; (u16::MAX as usize) + 1];
     let Ok(mut f) = qfilter::Filter::with_fingerprint_size(cap as u64, fp_size.clamp(7, 64)) else {
@@ -60,6 +56,18 @@ fuzz_target!(|input: Input| {
             let est = f.count_fingerprint(e as u64);
             assert!(est >= min, "{e}: est {est} < min {min} shrunk {shrunk:?}");
         }
+        let prints = f.fingerprints().collect::<Vec<_>>();
+        let mut expected_prints = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, n)| {
+                let t = (i as u64) << (64 - f.fingerprint_size()) >> (64 - f.fingerprint_size());
+                std::iter::repeat(t).take(*n as usize)
+            })
+            .collect::<Vec<_>>();
+        expected_prints.sort_unstable();
+        assert_eq!(prints.len(), f.len() as usize);
+        assert_eq!(prints, expected_prints);
         if !CHECK_SHRUNK {
             break;
         }
