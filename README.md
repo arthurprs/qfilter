@@ -1,9 +1,9 @@
 # Qfilter
 
-Efficient bloom filter like datastructure, based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
+Efficient bloom filter like data structure, based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
 
 This is a small and flexible general-purpose [AMQ-Filter](https://en.wikipedia.org/wiki/Approximate_Membership_Query_Filter).
-It not only supports approximate membership testing like a bloom filter but also deletions, merging (not implemented),
+It not only supports approximate membership testing like a bloom filter but also deletions, merging,
 resizing and [serde](https://crates.io/crates/serde) serialization.
 
 * High performance
@@ -12,6 +12,16 @@ resizing and [serde](https://crates.io/crates/serde) serialization.
 * Can be created with a initial small capacity and grow as needed
 * (De)Serializable with [serde](https://crates.io/crates/serde)
 * Portable Rust implementation
+* Only verifiable usages of unsafe
+
+This data structure is similar to a hash table that stores fingerprints in a very compact way.
+Fingerprints are similar to a hash values, but are possibly truncated.
+The reason for false positives is that multiple items can map to the same fingerprint.
+For more information see the [quotient filter Wikipedia page](https://en.wikipedia.org/wiki/Quotient_filter)
+that describes a similar but less optimized version of the data structure.
+The actual implementation is based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
+
+The public API also exposes a fingerprint API, which can be used to succinctly store u64 hash values.
 
 ### Example
 
@@ -33,45 +43,30 @@ The hashing algorithm used is [xxhash3](https://crates.io/crates/xxhash-rust) wh
 
 For a given capacity and error probability the RSQF may require significantly less space than the equivalent bloom filter or other AMQ-Filters.
 
-| Bits per item | Error probability when full |
-|--------|----------|
-| 3.125  | 0.362    |
-| 4.125  | 0.201    |
-| 5.125  | 0.106    |
-| 6.125  | 0.0547   |
-| 7.125  | 0.0277   |
-| 8.125  | 0.014    |
-| 9.125  | 0.00701  |
-| 10.125 | 0.00351  |
-| 11.125 | 0.00176  |
-| 12.125 | 0.000879 |
-| 13.125 | 0.000439 |
-| 14.125 | 0.00022  |
-| 15.125 | 0.00011  |
-| 16.125 | 5.49e-05 |
-| 17.125 | 2.75e-05 |
-| 18.125 | 1.37e-05 |
-| 19.125 | 6.87e-06 |
-| 20.125 | 3.43e-06 |
-| 21.125 | 1.72e-06 |
-| 22.125 | 8.58e-07 |
-| 23.125 | 4.29e-07 |
-| 24.125 | 2.15e-07 |
-| 25.125 | 1.07e-07 |
-| 26.125 | 5.36e-08 |
-| 27.125 | 2.68e-08 |
-| 28.125 | 1.34e-08 |
-| 29.125 | 6.71e-09 |
-| 30.125 | 3.35e-09 |
-| 31.125 | 1.68e-09 |
-| 32.125 | 8.38e-10 |
+| Bits per item | Error probability when full | Bits per item (Cont.) | Error (cont.) |
+|:---:|:---:|:---:|---|
+| 3.125 | 0.362 | 19.125 | 6.87e-06 |
+| 4.125 | 0.201 | 20.125 | 3.43e-06 |
+| 5.125 | 0.106 | 21.125 | 1.72e-06 |
+| 6.125 | 0.0547 | 22.125 | 8.58e-07 |
+| 7.125 | 0.0277 | 23.125 | 4.29e-07 |
+| 8.125 | 0.014 | 24.125 | 2.15e-07 |
+| 9.125 | 0.00701 | 25.125 | 1.07e-07 |
+| 10.125 | 0.00351 | 26.125 | 5.36e-08 |
+| 11.125 | 0.00176 | 27.125 | 2.68e-08 |
+| 12.125 | 0.000879 | 28.125 | 1.34e-08 |
+| 13.125 | 0.000439 | 29.125 | 6.71e-09 |
+| 14.125 | 0.00022 | 30.125 | 3.35e-09 |
+| 15.125 | 0.00011 | 31.125 | 1.68e-09 |
+| 16.125 | 5.49e-05 | 32.125 | 8.38e-10 |
+| 17.125 | 2.75e-05 | .. | .. |
+| 18.125 | 1.37e-05 | .. | .. |
 
 ### Not implemented
 
-- [ ] Merging
-- [ ] Shrink to fit
-- [ ] Counting
-- [ ] Smoother resizing by chaining exponentially larger and more precise filters
+- [ ] Fingerprint attached values
+- [ ] Counting with fingerprint values, not fingerprint duplication
+- [ ] More advanced growth strategies (InfiniFilter).
 
 ### Legacy x86_64 CPUs support
 

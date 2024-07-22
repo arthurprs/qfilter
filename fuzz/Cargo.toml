@@ -23,3 +23,9 @@ name = "fuzz_qfilter"
 path = "fuzz_targets/fuzz_qfilter.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_fingerprint"
+path = "fuzz_targets/fuzz_fingerprint.rs"
+test = false
+doc = false

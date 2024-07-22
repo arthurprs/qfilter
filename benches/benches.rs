@@ -6,11 +6,11 @@ use test::Bencher;
 
 #[bench]
 fn bench_new(b: &mut Bencher) {
-    b.iter(|| Filter::new(1000, 0.005));
+    b.iter(|| Filter::new(1000, 0.005).unwrap());
 }
 #[bench]
 fn bench_get_ok_medium(b: &mut Bencher) {
-    let mut f = Filter::new(100000, 0.01);
+    let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
         f.insert_duplicated(&i).unwrap();
     }
@@ -23,7 +23,7 @@ fn bench_get_ok_medium(b: &mut Bencher) {
 
 #[bench]
 fn bench_get_nok_medium(b: &mut Bencher) {
-    let mut f = Filter::new(100000, 0.01);
+    let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
         f.insert_duplicated(&i).unwrap();
     }
@@ -37,7 +37,7 @@ fn bench_get_nok_medium(b: &mut Bencher) {
 #[bench]
 fn bench_grow(b: &mut Bencher) {
     b.iter(|| {
-        let mut f = Filter::new(10000, 0.01);
+        let mut f = Filter::new(10000, 0.01).unwrap();
         for i in 0..f.capacity() {
             f.insert_duplicated(i).unwrap();
         }
@@ -47,7 +47,7 @@ fn bench_grow(b: &mut Bencher) {
 
 #[bench]
 fn bench_grow_from_90pct(b: &mut Bencher) {
-    let mut f = Filter::new(10000, 0.01);
+    let mut f = Filter::new(10000, 0.01).unwrap();
     for i in 0..f.capacity() / 10 * 9 {
         f.insert_duplicated(i).unwrap();
     }
@@ -63,7 +63,7 @@ fn bench_grow_from_90pct(b: &mut Bencher) {
 #[bench]
 fn bench_grow_resizeable(b: &mut Bencher) {
     b.iter(|| {
-        let mut f = Filter::new_resizeable(0, 10000, 0.01);
+        let mut f = Filter::new_resizeable(0, 10000, 0.01).unwrap();
         for i in 0u64.. {
             if f.insert_duplicated(i).is_err() {
                 break;
@@ -76,7 +76,7 @@ fn bench_grow_resizeable(b: &mut Bencher) {
 
 #[bench]
 fn bench_shrink(b: &mut Bencher) {
-    let mut f = Filter::new(10000, 0.01);
+    let mut f = Filter::new(10000, 0.01).unwrap();
     for i in 0..f.capacity() {
         let _ = f.insert(i);
     }
