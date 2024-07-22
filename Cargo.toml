@@ -1,6 +1,6 @@
 [package]
 name = "qfilter"
-version = "0.1.6"
+version = "0.2.0"
 description = "Efficient bloom filter like datastructure, based on the Rank Select Quotient Filter (RSQF)"
 repository = "https://github.com/arthurprs/qfilter"
 authors = ["Arthur Silva <arthurprs@gmail.com>"]
@@ -33,3 +33,7 @@ debug = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[package.metadata.docs.rs]
+features = ["stats"]
+rustdoc-args = ["--cfg", "docsrs"]
