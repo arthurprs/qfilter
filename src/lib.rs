@@ -52,6 +52,7 @@
 //!
 //! Support for such legacy x86_64 CPUs can be optionally enabled with the `legacy_x86_64_support`
 //! which incurs a ~10% performance penalty.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use std::{
     cmp::Ordering,
@@ -91,7 +92,7 @@ pub struct Filter {
             deserialize_with = "serde_bytes::deserialize"
         )
     )]
-    buffer: Vec<u8>,
+    buffer: Box<[u8]>,
     #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
     #[cfg_attr(feature = "serde", serde(rename = "q"))]
@@ -460,7 +461,7 @@ impl Filter {
         assert_ne!(num_blocks, 0);
         let block_bytes_size = 1 + 16 + 64 * rbits.u64() / 8;
         let buffer_bytes = num_blocks * block_bytes_size;
-        let buffer = vec![0u8; buffer_bytes.try_into().unwrap()];
+        let buffer = vec![0u8; buffer_bytes.try_into().unwrap()].into_boxed_slice();
         Ok(Self {
             buffer,
             qbits,
@@ -1746,12 +1747,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_merge() {
+        fn test(mut f1: Filter, mut f2: Filter, mut f3: Filter) {
+            assert!(f1.merge(true, &f1.clone()).is_ok());
+            assert!(f1.merge(true, &f2).is_ok());
+            assert!(f1.merge(true, &f3).is_ok());
+            assert!(f2.merge(true, &f1).is_err());
+            assert!(f2.merge(true, &f2.clone()).is_ok());
+            assert!(f2.merge(true, &f3).is_ok());
+            assert!(f3.merge(true, &f1).is_err());
+            assert!(f3.merge(true, &f2).is_err());
+            assert!(f3.merge(true, &f3.clone()).is_ok());
+
+            f1.insert_fingerprint(true, 1).unwrap();
+            f2.insert_fingerprint(true, 1).unwrap();
+            f2.insert_fingerprint(true, 2).unwrap();
+            f3.insert_fingerprint(true, 1).unwrap();
+            f3.insert_fingerprint(true, 2).unwrap();
+            f3.insert_fingerprint(true, 3).unwrap();
+            assert_eq!(f1.len(), 1);
+            assert_eq!(f2.len(), 2);
+            assert_eq!(f3.len(), 3);
+
+            f1.merge(false, &f1.clone()).unwrap();
+            assert_eq!(f1.len(), 1);
+            f1.merge(true, &f2.clone()).unwrap();
+            assert_eq!(f1.len(), 3);
+            f1.merge(false, &f3.clone()).unwrap();
+            assert_eq!(f1.len(), 4);
+
+            for _ in f1.len()..f1.capacity() {
+                f1.insert_fingerprint(true, 1).unwrap();
+            }
+            assert_eq!(f1.len(), f1.capacity());
+            assert!(matches!(
+                f1.insert_fingerprint(true, 1),
+                Err(Error::CapacityExceeded)
+            ));
+            assert!(matches!(
+                f1.merge(true, &f1.clone()),
+                Err(Error::CapacityExceeded)
+            ));
+            assert!(matches!(f1.insert_fingerprint(false, 1), Ok(false)));
+            assert!(matches!(f1.merge(false, &f1.clone()), Ok(())));
+        }
+        test(
+            Filter::with_fingerprint_size(1, 10).unwrap(),
+            Filter::with_fingerprint_size(1, 11).unwrap(),
+            Filter::with_fingerprint_size(1, 12).unwrap(),
+        );
+        test(
+            Filter::new(1, 0.01).unwrap(),
+            Filter::new(1, 0.001).unwrap(),
+            Filter::new(1, 0.0001).unwrap(),
+        );
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn test_serde() {
         for capacity in [100, 1000, 10000] {
             for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
-                let mut f = Filter::new(capacity, fp_ratio);
+                let mut f = Filter::new(capacity, fp_ratio).unwrap();
                 for i in 0..f.capacity() {
                     f.insert(i).unwrap();
                 }
