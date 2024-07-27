@@ -62,6 +62,12 @@ For a given capacity and error probability the RSQF may require significantly le
 | 17.125 | 2.75e-05 | .. | .. |
 | 18.125 | 1.37e-05 | .. | .. |
 
+### Compatibility between versions 0.1 and 0.2
+
+Version 0.2 changed public APIs (e.g. fallible constructors) which required a major version bump.
+
+Serialization is bidirectionally compatible between versions 0.1 and 0.2.
+
 ### Not implemented
 
 - [ ] Fingerprint attached values
