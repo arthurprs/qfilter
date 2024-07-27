@@ -26,6 +26,7 @@ schemars = { optional = true, version = "0.8" }
 
 [dev-dependencies]
 serde_cbor = "0.11"
+qfilter01 = { package = "qfilter", version = "0.1", features = ["serde"] }
 
 [profile.bench]
 opt-level = 3
