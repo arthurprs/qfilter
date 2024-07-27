@@ -19,7 +19,7 @@ jsonschema = ["schemars"]
 serde = ["dep:serde", "dep:serde_bytes"]
 
 [dependencies]
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 serde = { optional = true, version = "1", features = ["derive"] }
 serde_bytes = { optional = true, version = "0.11" }
 schemars = { optional = true, version = "0.8" }
