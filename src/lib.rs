@@ -1810,11 +1810,21 @@ mod tests {
         for capacity in [100, 1000, 10000] {
             for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
                 let mut f = Filter::new(capacity, fp_ratio).unwrap();
+                let mut f01 = qfilter01::Filter::new(capacity, fp_ratio);
                 for i in 0..f.capacity() {
                     f.insert(i).unwrap();
+                    f01.insert(i).unwrap();
                 }
 
                 let ser = serde_cbor::to_vec(&f).unwrap();
+                let ser01 = serde_cbor::to_vec(&f01).unwrap();
+                // ensure serde output is the same
+                assert_eq!(ser, ser01);
+
+                f = serde_cbor::from_slice(&ser).unwrap();
+                for i in 0..f.capacity() {
+                    f.contains(i);
+                }
                 dbg!(
                     f.current_error_ratio(),
                     f.max_error_ratio(),
@@ -1822,11 +1832,6 @@ mod tests {
                     f.len(),
                     ser.len()
                 );
-
-                f = serde_cbor::from_slice(&ser).unwrap();
-                for i in 0..f.capacity() {
-                    f.contains(i);
-                }
             }
         }
     }

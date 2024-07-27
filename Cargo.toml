@@ -1,6 +1,6 @@
 [package]
 name = "qfilter"
-version = "0.2.0"
+version = "0.2.1"
 description = "Efficient bloom filter like datastructure, based on the Rank Select Quotient Filter (RSQF)"
 repository = "https://github.com/arthurprs/qfilter"
 authors = ["Arthur Silva <arthurprs@gmail.com>"]
@@ -19,13 +19,14 @@ jsonschema = ["schemars"]
 serde = ["dep:serde", "dep:serde_bytes"]
 
 [dependencies]
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 serde = { optional = true, version = "1", features = ["derive"] }
 serde_bytes = { optional = true, version = "0.11" }
 schemars = { optional = true, version = "0.8" }
 
 [dev-dependencies]
 serde_cbor = "0.11"
+qfilter01 = { package = "qfilter", version = "0.1", features = ["serde"] }
 
 [profile.bench]
 opt-level = 3

@@ -8,14 +8,14 @@ use std::hash::Hasher;
 /// extended to 64 bits if needed.
 pub struct StableHasher {
     /// Using xxh3-64 with default seed/secret as the portable hasher.
-    state: xxhash_rust::xxh3::Xxh3,
+    state: xxhash_rust::xxh3::Xxh3Default,
 }
 
 impl StableHasher {
     #[inline]
     pub fn new() -> Self {
         Self {
-            state: xxhash_rust::xxh3::Xxh3::new(),
+            state: xxhash_rust::xxh3::Xxh3Default::new(),
         }
     }
 }
