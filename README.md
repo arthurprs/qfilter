@@ -1,5 +1,9 @@
 # Qfilter
 
+[![Crates.io](https://img.shields.io/crates/v/qfilter.svg)](https://crates.io/crates/qfilter)
+[![Docs](https://docs.rs/qfilter/badge.svg)](https://docs.rs/qfilter/latest)
+[![CI](https://github.com/arthurprs/qfilter/actions/workflows/ci.yml/badge.svg)](https://github.com/arthurprs/qfilter/actions/workflows/ci.yml)
+
 Efficient bloom filter like data structure, based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
 
 This is a small and flexible general-purpose [AMQ-Filter](https://en.wikipedia.org/wiki/Approximate_Membership_Query_Filter).
@@ -14,7 +18,7 @@ resizing and [serde](https://crates.io/crates/serde) serialization.
 * Portable Rust implementation
 * Only verifiable usages of unsafe
 
-This data structure is similar to a hash table that stores fingerprints in a very compact way.
+This data structure is a succinct hash table that can store fingerprints in a very compact way.
 Fingerprints are similar to a hash values, but are possibly truncated.
 The reason for false positives is that multiple items can map to the same fingerprint.
 For more information see the [quotient filter Wikipedia page](https://en.wikipedia.org/wiki/Quotient_filter)
@@ -70,9 +74,9 @@ Serialization is bidirectionally compatible between versions 0.1 and 0.2.
 
 ### Not implemented
 
-- [ ] Fingerprint attached values
-- [ ] Counting with fingerprint values, not fingerprint duplication
-- [ ] More advanced growth strategies (InfiniFilter).
+* [ ] Fingerprint attached values
+* [ ] Counting with fingerprint attached values, not fingerprint duplication
+* [ ] More advanced growth strategies (InfiniFilter).
 
 ### Legacy x86_64 CPUs support
 

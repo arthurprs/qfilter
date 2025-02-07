@@ -2,7 +2,7 @@
 //! based on the [Rank Select Quotient Filter (RSQF)](https://dl.acm.org/doi/pdf/10.1145/3035918.3035963).
 //!
 //! This is a small and flexible general-purpose AMQ-Filter, it not only supports approximate membership testing like a bloom filter
-//! but also deletions, merging (not implemented), resizing and [serde](https://crates.io/crates/serde) serialization.
+//! but also deletions, merging, resizing and [serde](https://crates.io/crates/serde) serialization.
 //!
 //! ### Example
 //!
