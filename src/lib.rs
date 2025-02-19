@@ -381,7 +381,7 @@ impl Filter {
     /// Creates a new filter that can hold at least `capacity` items
     /// and with a desired error rate of `fp_rate` (clamped to (0, 0.5]).
     ///
-    /// Errors if capacity is >= `u64::MAX / 20`` or if the specified filter isn't achievable using 64 bit hashes.
+    /// Errors if capacity is >= `u64::MAX / 20` or if the specified filter isn't achievable using 64 bit hashes.
     #[inline]
     pub fn new(capacity: u64, fp_rate: f64) -> Result<Self, Error> {
         Self::new_resizeable(capacity, capacity, fp_rate)
@@ -396,7 +396,7 @@ impl Filter {
     /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
     /// capacity its error rate also doubles.
     ///
-    /// Errors if capacity is >= `u64::MAX / 20`` or if the specified filter isn't achievable using 64 bit hashes.
+    /// Errors if capacity is >= `u64::MAX / 20` or if the specified filter isn't achievable using 64 bit hashes.
     pub fn new_resizeable(
         initial_capacity: u64,
         max_capacity: u64,
@@ -1132,27 +1132,29 @@ impl Filter {
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
         let hash = self.hash(item);
-        match self.insert_fingerprint(true, hash) {
+        match self.insert_impl(true, hash) {
             Ok(_added) => Ok(()),
             Err(_) => {
                 self.grow_if_possible()?;
-                self.insert_fingerprint(true, hash).map(|_| ())
+                self.insert_impl(true, hash).map(|_| ())
             }
         }
     }
 
-    /// Inserts `item` in the filter.
+    /// Inserts `item` in the filter if it's not already present (probabilistically).
+    /// Note that membership is probabilistic, so this function may return false positives
+    /// but never false negatives.
     ///
     /// Returns `Ok(true)` if the item was successfully added to the filter.
     /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
         let hash = self.hash(item);
-        match self.insert_fingerprint(false, hash) {
+        match self.insert_impl(false, hash) {
             Ok(added) => Ok(added),
             Err(_) => {
                 self.grow_if_possible()?;
-                self.insert_fingerprint(true, hash)
+                self.insert_impl(false, hash)
             }
         }
     }
@@ -1160,10 +1162,27 @@ impl Filter {
     /// Inserts the fingerprint specified by `hash` in the filter.
     /// `duplicate` specifies if the fingerprint should be added even if it's already in the filter.
     ///
+    /// Note that this function will automatically grow the filter if needed.
+    /// The implementation uses the first [`Self::fingerprint_size`] bits of `hash` to place the fingerprint in the appropriate slot.
+    /// The remaining bits are ignored and will be returned as 0 if the fingerprint is retrieved via [`Self::fingerprints`].
+    ///
     /// Returns `Ok(true)` if the item was successfully added to the filter.
     /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
     pub fn insert_fingerprint(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
+        match self.insert_impl(duplicate, hash) {
+            Ok(added) => Ok(added),
+            Err(_) => {
+                self.grow_if_possible()?;
+                self.insert_impl(duplicate, hash)
+            }
+        }
+    }
+
+    /// Inserts the fingerprint specified by `hash` in the filter.
+    /// `duplicate` specifies if the fingerprint should be added even if it's already in the filter.
+    /// It's up to the caller to grow the filter if needed and retry the insert.
+    fn insert_impl(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
         enum Operation {
             NewRun,
             BeforeRunend,
@@ -1290,7 +1309,7 @@ impl Filter {
             return Err(Error::IncompatibleFingerprintSize);
         }
         for hash in other.fingerprints() {
-            self.insert_fingerprint(keep_duplicates, hash)?;
+            self.insert_impl(keep_duplicates, hash)?;
         }
         Ok(())
     }
@@ -1717,6 +1736,21 @@ mod tests {
     }
 
     #[test]
+    fn test_with_fingerprint_size_resizes() {
+        let mut f = Filter::with_fingerprint_size(0, 8).unwrap();
+        assert_eq!(f.fingerprint_size(), 8);
+        assert_eq!(f.capacity_resizeable(), 128 * 19 / 20);
+        assert_eq!(f.capacity(), 64 * 19 / 20);
+        for i in 0..f.capacity_resizeable() {
+            f.insert_fingerprint(false, i).unwrap();
+        }
+        assert_eq!(f.len() as u64, f.capacity_resizeable());
+        assert!(f
+            .insert_fingerprint(false, f.capacity_resizeable())
+            .is_err());
+    }
+
+    #[test]
     fn test_with_fingerprint_size() {
         let fingerprints = [
             0u64,
@@ -1782,7 +1816,7 @@ mod tests {
             }
             assert_eq!(f1.len(), f1.capacity());
             assert!(matches!(
-                f1.insert_fingerprint(true, 1),
+                f1.insert_impl(true, 1),
                 Err(Error::CapacityExceeded)
             ));
             assert!(matches!(
