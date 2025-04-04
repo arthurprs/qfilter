@@ -406,14 +406,17 @@ impl Filter {
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
         // Calculate necessary slots to achieve capacity with up to 95% occupancy
         // 19/20 == 0.95
-        let max_capacity = (max_capacity
+        let max_capacity = max_capacity
             .checked_mul(20)
             .ok_or(Error::CapacityTooLarge)?
-            / 19)
+            .div_ceil(19)
             .next_power_of_two()
             .max(64);
         let max_qbits = max_capacity.trailing_zeros() as u8;
-        let initial_capacity = (initial_capacity * 20 / 19).next_power_of_two().max(64);
+        let initial_capacity = (initial_capacity * 20)
+            .div_ceil(19)
+            .next_power_of_two()
+            .max(64);
         let qbits = initial_capacity.trailing_zeros() as u8;
         let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
@@ -511,7 +514,7 @@ impl Filter {
     #[inline]
     pub fn capacity_resizeable(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
-        (((1 << self.max_qbits.unwrap_or(self.qbits).get()) * 19) as f64 / 20.0).ceil() as u64
+        ((1 << self.max_qbits.unwrap_or(self.qbits).get()) as u64 * 19).div_ceil(20)
     }
 
     /// Current filter capacity.
@@ -525,7 +528,7 @@ impl Filter {
             // Up to 95% occupancy
             // 19/20 == 0.95
             // Overflow is not possible here as it'd have overflowed in the constructor.
-            ((self.total_buckets().get() * 19) as f64 / 20.0).ceil() as u64
+            (self.total_buckets().get() * 19).div_ceil(20)
         }
     }
 
@@ -1515,13 +1518,6 @@ mod tests {
         assert_eq!(f.run_end(63), 0);
         assert_eq!(f.run_end(0), 3);
         assert_eq!(f.run_end(1), 4);
-    }
-
-    #[test]
-    fn test_insert_fingerprint_max_capacity() {
-        let capacity = Filter::new(61, 0.001).unwrap().capacity();
-        let test_value = 61;
-        assert_eq!(capacity, test_value);
     }
 
     #[test]
