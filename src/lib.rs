@@ -115,7 +115,7 @@ pub enum Error {
     IncompatibleFingerprintSize,
     /// The specified filter cannot be constructed with 64 bit hashes
     NotEnoughFingerprintBits,
-    /// Capacity is too large (>= u64::MAX / 20)
+    /// Capacity is too large. Filter::MAX_CAPACITY = 2^59 * 19 / 20.
     CapacityTooLarge,
 }
 
@@ -378,13 +378,39 @@ impl Iterator for FingerprintIter<'_> {
 }
 
 impl Filter {
+    /// Maximum log2 number of slots that can be used in the filter.
+    /// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
+    const MAX_QBITS: u8 = 59;
+
+    /// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
+    pub const MAX_CAPACITY: u64 = (2u64.pow(Self::MAX_QBITS as u32) * 19).div_ceil(20);
+
     /// Creates a new filter that can hold at least `capacity` items
     /// and with a desired error rate of `fp_rate` (clamped to (0, 0.5]).
     ///
-    /// Errors if capacity is >= `u64::MAX / 20` or if the specified filter isn't achievable using 64 bit hashes.
+    /// Errors if capacity is too large if the specified filter isn't achievable using 64 bit hashes.
     #[inline]
     pub fn new(capacity: u64, fp_rate: f64) -> Result<Self, Error> {
         Self::new_resizeable(capacity, capacity, fp_rate)
+    }
+
+    /// Calculates the number of slots needed to fit the desired fingerprints with 95% occupation.
+    /// Returns the number of slots needed rounded to the next power of two, but always >= 64.
+    fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
+        let mut slots = desired
+            .checked_next_power_of_two()
+            .ok_or(Error::CapacityTooLarge)?
+            .max(64);
+        loop {
+            let capacity = slots
+                .checked_mul(19)
+                .ok_or(Error::CapacityTooLarge)?
+                .div_ceil(20);
+            if capacity >= desired {
+                return Ok(slots);
+            }
+            slots = slots.checked_mul(2).ok_or(Error::CapacityTooLarge)?;
+        }
     }
 
     /// Creates a new filter that can hold at least `initial_capacity` items initially
@@ -396,28 +422,18 @@ impl Filter {
     /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
     /// capacity its error rate also doubles.
     ///
-    /// Errors if capacity is >= `u64::MAX / 20` or if the specified filter isn't achievable using 64 bit hashes.
+    /// Errors if max_capacity is too large or if the specified filter isn't achievable using 64 bit hashes.
     pub fn new_resizeable(
         initial_capacity: u64,
         max_capacity: u64,
         fp_rate: f64,
     ) -> Result<Self, Error> {
         assert!(max_capacity >= initial_capacity);
+        let slots_for_capacity = Self::calculate_needed_slots(initial_capacity)?;
+        let qbits = slots_for_capacity.trailing_zeros() as u8;
+        let slots_for_max_capacity = Self::calculate_needed_slots(max_capacity)?;
+        let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
-        // Calculate necessary slots to achieve capacity with up to 95% occupancy
-        // 19/20 == 0.95
-        let max_capacity = max_capacity
-            .checked_mul(20)
-            .ok_or(Error::CapacityTooLarge)?
-            .div_ceil(19)
-            .next_power_of_two()
-            .max(64);
-        let max_qbits = max_capacity.trailing_zeros() as u8;
-        let initial_capacity = (initial_capacity * 20)
-            .div_ceil(19)
-            .next_power_of_two()
-            .max(64);
-        let qbits = initial_capacity.trailing_zeros() as u8;
         let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
         if max_qbits > qbits {
@@ -436,20 +452,15 @@ impl Filter {
         if !(7..=64).contains(&fingerprint_bits) {
             return Err(Error::NotEnoughFingerprintBits);
         }
-        let initial_capacity = (initial_capacity
-            .checked_mul(20)
-            .ok_or(Error::CapacityTooLarge)?
-            / 19)
-            .next_power_of_two()
-            .max(64);
-        let qbits = initial_capacity.trailing_zeros() as u8;
+        let slots_for_capacity = Self::calculate_needed_slots(initial_capacity)?;
+        let qbits = slots_for_capacity.trailing_zeros() as u8;
         if fingerprint_bits <= qbits {
             return Err(Error::NotEnoughFingerprintBits);
         }
         let rbits = fingerprint_bits - qbits;
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
         if rbits > 1 {
-            result.max_qbits = Some((qbits + rbits - 1).try_into().unwrap());
+            result.max_qbits = Some((qbits + rbits - 1).min(Self::MAX_QBITS).try_into().unwrap());
         }
         Ok(result)
     }
@@ -504,6 +515,12 @@ impl Filter {
         self.len
     }
 
+    /// Current memory usage in bytes.
+    #[inline]
+    pub fn memory_usage(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Resets/Clears the filter.
     pub fn clear(&mut self) {
         self.buffer.fill(0);
@@ -514,7 +531,7 @@ impl Filter {
     #[inline]
     pub fn capacity_resizeable(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
-        ((1 << self.max_qbits.unwrap_or(self.qbits).get()) as u64 * 19).div_ceil(20)
+        ((1u64 << self.max_qbits.unwrap_or(self.qbits).get()) * 19).div_ceil(20)
     }
 
     /// Current filter capacity.
@@ -581,9 +598,8 @@ impl Filter {
     fn block(&self, block_num: u64) -> Block {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
-        let block_bytes: &[u8; 1 + 8 + 8] = &self.buffer[block_start..block_start + 1 + 8 + 8]
-            .try_into()
-            .unwrap();
+        let block_bytes: &[u8; 1 + 8 + 8] =
+            &self.buffer[block_start..][..1 + 8 + 8].try_into().unwrap();
         let offset = {
             if block_bytes[0] < u8::MAX {
                 block_bytes[0] as u64
@@ -673,11 +689,7 @@ impl Filter {
     fn is_occupied(&self, hash_bucket_idx: u64) -> bool {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let occupieds = u64::from_le_bytes(
-            self.buffer[block_start + 1..block_start + 1 + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let occupieds = u64::from_le_bytes(self.buffer[block_start + 1..][..8].try_into().unwrap());
         occupieds.is_bit_set((hash_bucket_idx % 64) as usize)
     }
 
@@ -685,24 +697,18 @@ impl Filter {
     fn set_occupied(&mut self, hash_bucket_idx: u64, value: bool) {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let mut occupieds = u64::from_le_bytes(
-            self.buffer[block_start + 1..block_start + 1 + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let mut occupieds =
+            u64::from_le_bytes(self.buffer[block_start + 1..][..8].try_into().unwrap());
         occupieds.update_bit((hash_bucket_idx % 64) as usize, value);
-        self.buffer[block_start + 1..block_start + 1 + 8].copy_from_slice(&occupieds.to_le_bytes());
+        self.buffer[block_start + 1..][..8].copy_from_slice(&occupieds.to_le_bytes());
     }
 
     #[inline(always)]
     fn is_runend(&self, hash_bucket_idx: u64) -> bool {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let runends = u64::from_le_bytes(
-            self.buffer[block_start + 1 + 8..block_start + 1 + 8 + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let runends =
+            u64::from_le_bytes(self.buffer[block_start + 1 + 8..][..8].try_into().unwrap());
         runends.is_bit_set((hash_bucket_idx % 64) as usize)
     }
 
@@ -710,14 +716,10 @@ impl Filter {
     fn set_runend(&mut self, hash_bucket_idx: u64, value: bool) {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let mut runends = u64::from_le_bytes(
-            self.buffer[block_start + 1 + 8..block_start + 1 + 8 + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let mut runends =
+            u64::from_le_bytes(self.buffer[block_start + 1 + 8..][..8].try_into().unwrap());
         runends.update_bit((hash_bucket_idx % 64) as usize, value);
-        self.buffer[block_start + 1 + 8..block_start + 1 + 8 + 8]
-            .copy_from_slice(&runends.to_le_bytes());
+        self.buffer[block_start + 1 + 8..][..8].copy_from_slice(&runends.to_le_bytes());
     }
 
     #[inline(always)]
@@ -1742,11 +1744,8 @@ mod tests {
     fn test_with_fingerprint_size_resizes() {
         let mut f = Filter::with_fingerprint_size(0, 8).unwrap();
         assert_eq!(f.fingerprint_size(), 8);
-        assert_eq!(
-            f.capacity_resizeable(),
-            (128.0_f64 * 19.0 / 20.0).ceil() as u64
-        );
-        assert_eq!(f.capacity(), (64.0_f64 * 19.0 / 20.0).ceil() as u64);
+        assert_eq!(f.capacity_resizeable(), (128u64 * 19).div_ceil(20));
+        assert_eq!(f.capacity(), (64u64 * 19).div_ceil(20));
         for i in 0..f.capacity_resizeable() {
             f.insert_fingerprint(false, i).unwrap();
         }
@@ -1903,7 +1902,31 @@ mod tests {
                     i,
                     filter.capacity()
                 );
+                assert_eq!(filter.capacity(), filter.capacity_resizeable());
             }
         }
+    }
+
+    #[test]
+    fn test_max_capacity() {
+        for i in 7..=64 {
+            let f = Filter::with_fingerprint_size(0, i).unwrap();
+            assert!(f.capacity() <= f.capacity_resizeable());
+            assert_eq!(
+                f.capacity_resizeable(),
+                ((1u64 << (i - 1).min(Filter::MAX_QBITS)) * 19).div_ceil(20)
+            );
+        }
+        for i in 1..Filter::MAX_QBITS {
+            let f = Filter::new_resizeable(0, 2u64.pow(i as u32), 0.5).unwrap();
+            assert_eq!(f.capacity(), 61);
+            assert!(f.capacity() <= f.capacity_resizeable());
+        }
+        // Test the maximum capacity
+        let f = Filter::new_resizeable(0, Filter::MAX_CAPACITY, 0.5).unwrap();
+        assert_eq!(f.capacity(), 61);
+        assert_eq!(f.capacity_resizeable(), Filter::MAX_CAPACITY);
+        // Test the maximum capacity + 1, which should fail
+        Filter::new_resizeable(0, Filter::MAX_CAPACITY + 1, 0.5).unwrap_err();
     }
 }
