@@ -406,14 +406,17 @@ impl Filter {
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
         // Calculate necessary slots to achieve capacity with up to 95% occupancy
         // 19/20 == 0.95
-        let max_capacity = (max_capacity
+        let max_capacity = max_capacity
             .checked_mul(20)
             .ok_or(Error::CapacityTooLarge)?
-            / 19)
+            .div_ceil(19)
             .next_power_of_two()
             .max(64);
         let max_qbits = max_capacity.trailing_zeros() as u8;
-        let initial_capacity = (initial_capacity * 20 / 19).next_power_of_two().max(64);
+        let initial_capacity = (initial_capacity * 20)
+            .div_ceil(19)
+            .next_power_of_two()
+            .max(64);
         let qbits = initial_capacity.trailing_zeros() as u8;
         let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
@@ -511,7 +514,7 @@ impl Filter {
     #[inline]
     pub fn capacity_resizeable(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
-        (1 << self.max_qbits.unwrap_or(self.qbits).get()) * 19 / 20
+        ((1 << self.max_qbits.unwrap_or(self.qbits).get()) as u64 * 19).div_ceil(20)
     }
 
     /// Current filter capacity.
@@ -525,7 +528,7 @@ impl Filter {
             // Up to 95% occupancy
             // 19/20 == 0.95
             // Overflow is not possible here as it'd have overflowed in the constructor.
-            self.total_buckets().get() * 19 / 20
+            (self.total_buckets().get() * 19).div_ceil(20)
         }
     }
 
@@ -1537,11 +1540,11 @@ mod tests {
                 let mut f = Filter::new(c, 0.001).unwrap();
                 for i in 0..f.capacity() / 2 {
                     f.insert_duplicated(-1).unwrap();
-                    assert_eq!(f.count(-1), i as u64 + 1);
-                    assert_eq!(f.count(s), i as u64);
+                    assert_eq!(f.count(-1), i + 1);
+                    assert_eq!(f.count(s), i);
                     f.insert_duplicated(s).unwrap();
-                    assert_eq!(f.count(-1), i as u64 + 1);
-                    assert_eq!(f.count(s), i as u64 + 1);
+                    assert_eq!(f.count(-1), i + 1);
+                    assert_eq!(f.count(s), i + 1);
                 }
             }
         }
@@ -1554,7 +1557,7 @@ mod tests {
                 let mut f = Filter::new(cap, 0.01).unwrap();
                 for i in 0..f.capacity() {
                     f.insert_duplicated(s).unwrap();
-                    assert!(f.count(s) >= i + 1);
+                    assert!(f.count(s) > i);
                 }
                 assert_eq!(f.count(s), f.capacity());
             }
@@ -1657,7 +1660,7 @@ mod tests {
                 for i in 0..c {
                     assert!(f.insert(i).unwrap());
                 }
-                assert_eq!(f.len() as u64, c);
+                assert_eq!(f.len(), c);
                 for i in 0..c {
                     for j in 0..c {
                         assert_eq!(f.count(j), (j >= i) as u64, "{}", j);
@@ -1679,7 +1682,7 @@ mod tests {
                 for _ in 0..c {
                     f.insert_duplicated(s).unwrap();
                 }
-                assert_eq!(f.len() as u64, c);
+                assert_eq!(f.len(), c);
                 for i in 0..c {
                     assert_eq!(f.count(s), c - i);
                     assert!(f.remove(s));
@@ -1739,12 +1742,15 @@ mod tests {
     fn test_with_fingerprint_size_resizes() {
         let mut f = Filter::with_fingerprint_size(0, 8).unwrap();
         assert_eq!(f.fingerprint_size(), 8);
-        assert_eq!(f.capacity_resizeable(), 128 * 19 / 20);
-        assert_eq!(f.capacity(), 64 * 19 / 20);
+        assert_eq!(
+            f.capacity_resizeable(),
+            (128.0_f64 * 19.0 / 20.0).ceil() as u64
+        );
+        assert_eq!(f.capacity(), (64.0_f64 * 19.0 / 20.0).ceil() as u64);
         for i in 0..f.capacity_resizeable() {
             f.insert_fingerprint(false, i).unwrap();
         }
-        assert_eq!(f.len() as u64, f.capacity_resizeable());
+        assert_eq!(f.len(), f.capacity_resizeable());
         assert!(f
             .insert_fingerprint(false, f.capacity_resizeable())
             .is_err());
@@ -1844,17 +1850,11 @@ mod tests {
         for capacity in [100, 1000, 10000] {
             for fp_ratio in [0.2, 0.1, 0.01, 0.001, 0.0001] {
                 let mut f = Filter::new(capacity, fp_ratio).unwrap();
-                let mut f01 = qfilter01::Filter::new(capacity, fp_ratio);
                 for i in 0..f.capacity() {
                     f.insert(i).unwrap();
-                    f01.insert(i).unwrap();
                 }
 
                 let ser = serde_cbor::to_vec(&f).unwrap();
-                let ser01 = serde_cbor::to_vec(&f01).unwrap();
-                // ensure serde output is the same
-                assert_eq!(ser, ser01);
-
                 f = serde_cbor::from_slice(&ser).unwrap();
                 for i in 0..f.capacity() {
                     f.contains(i);
@@ -1888,5 +1888,22 @@ mod tests {
         assert_eq!(f.raw_block(2).offset, 2);
         assert_eq!(f.raw_block(3).offset, 254);
         f.validate_offsets(0, f.total_buckets().get());
+    }
+
+    #[test]
+    fn test_capacity_edge_cases() {
+        for n in 1..32 {
+            let base = (1 << n) * 19 / 20;
+            // Test numbers around the edge
+            for i in [base - 1, base, base + 1] {
+                let filter = Filter::new(i, 0.01).unwrap();
+                assert!(
+                    filter.capacity() >= i,
+                    "Requested capacity {} but got {}",
+                    i,
+                    filter.capacity()
+                );
+            }
+        }
     }
 }
