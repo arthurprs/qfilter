@@ -1135,15 +1135,9 @@ impl Filter {
     /// and the item is known to not have been added to the filter before (or was removed).
     ///
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    #[inline]
     pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
-        let hash = self.hash(item);
-        match self.insert_impl(true, hash) {
-            Ok(_added) => Ok(()),
-            Err(_) => {
-                self.grow_if_possible()?;
-                self.insert_impl(true, hash).map(|_| ())
-            }
-        }
+        self.insert_counting(u64::MAX, item).map(|_| ())
     }
 
     /// Inserts `item` in the filter if it's not already present (probabilistically).
@@ -1153,13 +1147,25 @@ impl Filter {
     /// Returns `Ok(true)` if the item was successfully added to the filter.
     /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    #[inline]
     pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
+        self.insert_counting(1, item).map(|count| count == 0)
+    }
+
+    /// Inserts `item` in the filter, even if already appears to be in the filter.
+    /// This works by inserting a possibly duplicated fingerprint in the filter.
+    /// The argument `max_count` specifies how many duplicates can be inserted.
+    ///
+    /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
+    /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error> {
         let hash = self.hash(item);
-        match self.insert_impl(false, hash) {
-            Ok(added) => Ok(added),
+        match self.insert_impl(max_count, hash) {
+            Ok(count) => Ok(count),
             Err(_) => {
                 self.grow_if_possible()?;
-                self.insert_impl(false, hash)
+                self.insert_impl(max_count, hash)
             }
         }
     }
@@ -1172,22 +1178,42 @@ impl Filter {
     /// The remaining bits are ignored and will be returned as 0 if the fingerprint is retrieved via [`Self::fingerprints`].
     ///
     /// Returns `Ok(true)` if the item was successfully added to the filter.
-    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
+    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter. Possible if `duplicate` is `false`.
     /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    #[inline]
     pub fn insert_fingerprint(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
-        match self.insert_impl(duplicate, hash) {
-            Ok(added) => Ok(added),
+        let max_count = if duplicate { u64::MAX } else { 1 };
+        self.insert_fingerprint_counting(max_count, hash)
+            .map(|count| count < max_count)
+    }
+
+    /// Inserts the fingerprint specified by `hash` in the filter.
+    /// `max_count` specifies how many occurences of the fingerprint can be added to the filter.
+    ///
+    /// Note that this function will automatically grow the filter if needed.
+    /// The implementation uses the first [`Self::fingerprint_size`] bits of `hash` to place the fingerprint in the appropriate slot.
+    /// The remaining bits are ignored and will be returned as 0 if the fingerprint is retrieved via [`Self::fingerprints`].
+    ///
+    /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
+    /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    pub fn insert_fingerprint_counting(&mut self, max_count: u64, hash: u64) -> Result<u64, Error> {
+        match self.insert_impl(max_count, hash) {
+            Ok(count) => Ok(count),
             Err(_) => {
                 self.grow_if_possible()?;
-                self.insert_impl(duplicate, hash)
+                self.insert_impl(max_count, hash)
             }
         }
     }
 
     /// Inserts the fingerprint specified by `hash` in the filter.
-    /// `duplicate` specifies if the fingerprint should be added even if it's already in the filter.
+    /// `max_count` specifies how many occurences of the fingerprint can be added to the filter.
     /// It's up to the caller to grow the filter if needed and retry the insert.
-    fn insert_impl(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
+    ///
+    /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter.
+    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    fn insert_impl(&mut self, max_count: u64, hash: u64) -> Result<u64, Error> {
         enum Operation {
             NewRun,
             BeforeRunend,
@@ -1205,11 +1231,12 @@ impl Filter {
             self.set_runend(hash_bucket_idx, true);
             self.set_remainder(hash_bucket_idx, hash_remainder);
             self.len += 1;
-            return Ok(true);
+            return Ok(0);
         }
 
         let mut runstart_idx = self.run_start(hash_bucket_idx);
         let mut runend_idx = self.run_end(hash_bucket_idx);
+        let mut fingerprint_count = 0;
         let insert_idx;
         let operation;
         if self.is_occupied(hash_bucket_idx) {
@@ -1219,10 +1246,14 @@ impl Filter {
             }
             while runstart_idx <= runend_idx {
                 match self.get_remainder(runstart_idx).cmp(&hash_remainder) {
-                    Ordering::Less => (), // TODO: sorted hashes appears to have no positive impact
-                    Ordering::Equal if duplicate => (),
-                    Ordering::Equal => return Ok(false),
+                    Ordering::Equal => {
+                        fingerprint_count += 1;
+                        if fingerprint_count >= max_count {
+                            return Ok(fingerprint_count);
+                        }
+                    }
                     Ordering::Greater => break,
+                    Ordering::Less => (),
                 }
 
                 runstart_idx += 1;
@@ -1267,7 +1298,7 @@ impl Filter {
 
         self.inc_offsets(hash_bucket_idx, empty_slot_idx);
         self.len += 1;
-        Ok(true)
+        Ok(fingerprint_count)
     }
 
     /// Returns an iterator over the fingerprints stored in the filter.
@@ -1313,8 +1344,9 @@ impl Filter {
         if other.fingerprint_size() < self.fingerprint_size() {
             return Err(Error::IncompatibleFingerprintSize);
         }
+        let max_count = if keep_duplicates { u64::MAX } else { 1 };
         for hash in other.fingerprints() {
-            self.insert_impl(keep_duplicates, hash)?;
+            self.insert_impl(max_count, hash)?;
         }
         Ok(())
     }
@@ -1821,7 +1853,7 @@ mod tests {
             }
             assert_eq!(f1.len(), f1.capacity());
             assert!(matches!(
-                f1.insert_impl(true, 1),
+                f1.insert_impl(u64::MAX, 1),
                 Err(Error::CapacityExceeded)
             ));
             assert!(matches!(
