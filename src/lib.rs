@@ -134,6 +134,25 @@ struct Block {
     runends: u64,
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn bmi2_is_available() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    const UNKNOWN: u8 = 2;
+    static BMI2_AVAILABLE: AtomicU8 = AtomicU8::new(UNKNOWN);
+
+    match BMI2_AVAILABLE.load(Ordering::Acquire) {
+        0 => false,
+        1 => true,
+        _ => {
+            let available = std::is_x86_feature_detected!("bmi2");
+            BMI2_AVAILABLE.store(available as u8, Ordering::Release);
+            available
+        }
+    }
+}
+
 trait BitExt {
     fn is_bit_set(&self, i: usize) -> bool;
     fn set_bit(&mut self, i: usize);
@@ -263,7 +282,7 @@ impl BitExt for u64 {
         #[cfg(target_arch = "x86_64")]
         let result = {
             // TODO: AMD CPUs up to Zen2 have slow BMI implementations
-            if std::is_x86_feature_detected!("bmi2") {
+            if bmi2_is_available() {
                 // This is the equivalent intrinsics version of the inline assembly below.
                 // #[target_feature(enable = "bmi1")]
                 // #[target_feature(enable = "bmi2")]
@@ -434,7 +453,7 @@ impl Filter {
         let slots_for_max_capacity = Self::calculate_needed_slots(max_capacity)?;
         let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
-        let rbits = (-fp_rate.log2()).round().max(1.0) as u8 + (max_qbits - qbits);
+        let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
         if max_qbits > qbits {
             result.max_qbits = Some(max_qbits.try_into().unwrap());
@@ -1623,6 +1642,17 @@ mod tests {
     }
 
     #[test]
+    fn test_new_resizeable_fp_rate_ceiling() {
+        let f = Filter::new_resizeable(0, 1000, 0.05).unwrap();
+        let ratio = f.max_error_ratio_resizeable();
+        assert!(
+            ratio <= 0.05,
+            "max error ratio {} exceeds requested fp rate",
+            ratio
+        );
+    }
+
+    #[test]
     #[should_panic]
     fn test_new_capacity_overflow() {
         Filter::new_resizeable(100, u64::MAX, 0.01).unwrap();
@@ -1906,7 +1936,9 @@ mod tests {
         // case found in fuzz testing
         #[rustfmt::skip]
         let sample = [(0u16, 287), (2u16, 1), (9u16, 2), (10u16, 1), (53u16, 5), (61u16, 5), (127u16, 2), (232u16, 1), (255u16, 21), (314u16, 2), (317u16, 2), (384u16, 2), (511u16, 3), (512u16, 2), (1599u16, 2), (2303u16, 5), (2559u16, 2), (2568u16, 3), (2815u16, 2), (6400u16, 2), (9211u16, 2), (9728u16, 2), (10790u16, 1), (10794u16, 94), (10797u16, 2), (10999u16, 2), (11007u16, 2), (11520u16, 1), (12800u16, 4), (12842u16, 2), (13823u16, 1), (14984u16, 2), (15617u16, 2), (15871u16, 4), (16128u16, 3), (16383u16, 2), (16394u16, 1), (18167u16, 2), (23807u16, 1), (32759u16, 2)];
-        let mut f = Filter::new(400, 0.1).unwrap();
+        let template = Filter::new(400, 0.1).unwrap();
+        let fingerprint_bits = template.qbits.get() + 3;
+        let mut f = Filter::with_fingerprint_size(400, fingerprint_bits).unwrap();
         for (i, c) in sample {
             for _ in 0..c {
                 f.insert_duplicated(i).unwrap();

@@ -35,6 +35,19 @@ fn bench_get_nok_medium(b: &mut Bencher) {
 }
 
 #[bench]
+fn bench_contains_hot(b: &mut Bencher) {
+    let mut f = Filter::new(20000, 0.01).unwrap();
+    for i in 0..f.capacity() {
+        f.insert_duplicated(i).unwrap();
+    }
+    let mut probe = 0u64;
+    b.iter(|| {
+        probe = probe.wrapping_add(1) % f.capacity();
+        f.contains(probe)
+    })
+}
+
+#[bench]
 fn bench_grow(b: &mut Bencher) {
     b.iter(|| {
         let mut f = Filter::new(10000, 0.01).unwrap();

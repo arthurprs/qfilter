@@ -30,7 +30,7 @@ The public API also exposes a fingerprint API, which can be used to succinctly s
 ### Example
 
 ```rust
-let mut f = qfilter::Filter::new(1000000, 0.01);
+let mut f = qfilter::Filter::new(1000000, 0.01).unwrap();
 for i in 0..1000 {
     f.insert(i).unwrap();
 }
