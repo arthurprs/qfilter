@@ -1304,7 +1304,7 @@ impl Filter {
     /// Returns an iterator over the fingerprints stored in the filter.
     ///
     /// Fingerprints will be returned in ascending order.
-    pub fn fingerprints(&self) -> FingerprintIter {
+    pub fn fingerprints(&self) -> FingerprintIter<'_> {
         FingerprintIter::new(self)
     }
 
