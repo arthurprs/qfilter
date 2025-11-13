@@ -134,25 +134,6 @@ struct Block {
     runends: u64,
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn bmi2_is_available() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    const UNKNOWN: u8 = 2;
-    static BMI2_AVAILABLE: AtomicU8 = AtomicU8::new(UNKNOWN);
-
-    match BMI2_AVAILABLE.load(Ordering::Acquire) {
-        0 => false,
-        1 => true,
-        _ => {
-            let available = std::is_x86_feature_detected!("bmi2");
-            BMI2_AVAILABLE.store(available as u8, Ordering::Release);
-            available
-        }
-    }
-}
-
 trait BitExt {
     fn is_bit_set(&self, i: usize) -> bool;
     fn set_bit(&mut self, i: usize);
@@ -282,7 +263,7 @@ impl BitExt for u64 {
         #[cfg(target_arch = "x86_64")]
         let result = {
             // TODO: AMD CPUs up to Zen2 have slow BMI implementations
-            if bmi2_is_available() {
+            if std::is_x86_feature_detected!("bmi2") {
                 // This is the equivalent intrinsics version of the inline assembly below.
                 // #[target_feature(enable = "bmi1")]
                 // #[target_feature(enable = "bmi2")]
