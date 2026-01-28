@@ -32,6 +32,10 @@ serde_cbor = "0.11"
 name = "benches"
 harness = false
 
+[[bench]]
+name = "select_bench"
+harness = false
+
 [profile.bench]
 opt-level = 3
 debug = true
