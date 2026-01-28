@@ -86,7 +86,7 @@ The implementation assumes `popcnt` and BMI2 (`pdep`, `tzcnt`) instructions are 
 when compiling for x86_64 targets. These instructions are available on CPUs from 2015 or later. If they are not available, the Filter constructor will panic.
 
 The `legacy_x86_64_support` feature enables support for older x86_64 CPUs by using
-a portable fallbacks and a ~10% performance penalty.
+portable fallbacks and a ~10% performance penalty.
 
 ### License
 
