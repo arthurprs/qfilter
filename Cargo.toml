@@ -1,6 +1,6 @@
 [package]
 name = "qfilter"
-version = "0.2.5"
+version = "0.3.0-alpha.1"
 description = "Efficient bloom filter like datastructure, based on the Rank Select Quotient Filter (RSQF)"
 repository = "https://github.com/arthurprs/qfilter"
 authors = ["Arthur Silva <arthurprs@gmail.com>"]
@@ -22,11 +22,19 @@ serde = ["dep:serde", "dep:serde_bytes"]
 xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 serde = { optional = true, version = "1", features = ["derive"] }
 serde_bytes = { optional = true, version = "0.11" }
-schemars = { optional = true, version = "0.8" }
+schemars = { optional = true, version = "1" }
 
 [dev-dependencies]
+criterion = "0.8"
 serde_cbor = "0.11"
-qfilter01 = { package = "qfilter", version = "0.1", features = ["serde"] }
+
+[[bench]]
+name = "benches"
+harness = false
+
+[[bench]]
+name = "select_bench"
+harness = false
 
 [profile.bench]
 opt-level = 3

@@ -66,7 +66,9 @@ For a given capacity and error probability the RSQF may require significantly le
 | 17.125 | 2.75e-05 | .. | .. |
 | 18.125 | 1.37e-05 | .. | .. |
 
-### Compatibility between versions 0.1 and 0.2
+### Compatibility between versions
+
+Version 0.3 is _not_ serialization compatible with previous versions.
 
 Version 0.2 changed public APIs (e.g. fallible constructors) which required a major version bump.
 
@@ -80,12 +82,11 @@ Serialization is bidirectionally compatible between versions 0.1 and 0.2.
 
 ### Legacy x86_64 CPUs support
 
-The implementation assumes the `popcnt` instruction (equivalent to `integer.count_ones()`) is present
-when compiling for x86_64 targets. This is theoretically not guaranteed as the instruction is only
-available on AMD/Intel CPUs released after 2007/2008. If that's not the case the Filter constructor will panic.
+The implementation assumes `popcnt` and BMI2 (`pdep`, `tzcnt`) instructions are available
+when compiling for x86_64 targets. These instructions are available on CPUs from 2015 or later. If they are not available, the Filter constructor will panic.
 
-Support for such legacy x86_64 CPUs can be optionally enabled with the `legacy_x86_64_support`
-which incurs a ~10% performance penalty.
+The `legacy_x86_64_support` feature enables support for older x86_64 CPUs by using
+portable fallbacks and a ~10% performance penalty.
 
 ### License
 

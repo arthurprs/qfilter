@@ -1,103 +1,183 @@
-#![feature(test)]
-extern crate test;
-
+use criterion::{criterion_group, criterion_main, Criterion};
 use qfilter::*;
-use test::Bencher;
 
-#[bench]
-fn bench_new(b: &mut Bencher) {
-    b.iter(|| Filter::new(1000, 0.005).unwrap());
+fn bench_new(c: &mut Criterion) {
+    c.bench_function("new", |b| b.iter(|| Filter::new(1000, 0.005).unwrap()));
 }
-#[bench]
-fn bench_get_ok_medium(b: &mut Bencher) {
+
+fn bench_get_ok_medium(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
         f.insert_duplicated(&i).unwrap();
     }
-    let mut i = 0;
-    b.iter(|| {
-        i += 1;
-        f.contains(&i)
-    })
-}
-
-#[bench]
-fn bench_get_nok_medium(b: &mut Bencher) {
-    let mut f = Filter::new(100000, 0.01).unwrap();
-    for i in 0..f.capacity() {
-        f.insert_duplicated(&i).unwrap();
-    }
-    let mut i = f.capacity();
-    b.iter(|| {
-        i += 1;
-        f.contains(&i)
-    })
-}
-
-#[bench]
-fn bench_contains_hot(b: &mut Bencher) {
-    let mut f = Filter::new(20000, 0.01).unwrap();
-    for i in 0..f.capacity() {
-        f.insert_duplicated(i).unwrap();
-    }
-    let mut probe = 0u64;
-    b.iter(|| {
-        probe = probe.wrapping_add(1) % f.capacity();
-        f.contains(probe)
-    })
-}
-
-#[bench]
-fn bench_grow(b: &mut Bencher) {
-    b.iter(|| {
-        let mut f = Filter::new(10000, 0.01).unwrap();
-        for i in 0..f.capacity() {
-            f.insert_duplicated(i).unwrap();
-        }
-        f
+    let capacity = f.capacity();
+    c.bench_function("get_ok_medium", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let mut n = 0;
+            for _ in 0..100 {
+                n += f.contains(&i) as u64;
+                i = (i + 1) % capacity;
+            }
+            n
+        })
     });
 }
 
-#[bench]
-fn bench_grow_from_90pct(b: &mut Bencher) {
+fn bench_get_nok_medium(c: &mut Criterion) {
+    let mut f = Filter::new(100000, 0.01).unwrap();
+    for i in 0..f.capacity() {
+        f.insert_duplicated(&i).unwrap();
+    }
+    c.bench_function("get_nok_medium", |b| {
+        let mut i = f.capacity();
+        b.iter(|| {
+            let mut n = 0;
+            for _ in 0..100 {
+                n += f.contains(&i) as u64;
+                i = i.wrapping_add(1);
+            }
+            n
+        })
+    });
+}
+
+fn bench_get_ok_medium_75(c: &mut Criterion) {
+    let mut f = Filter::new(100000, 0.01).unwrap();
+    for i in 0..f.capacity() * 3 / 4 {
+        f.insert_duplicated(&i).unwrap();
+    }
+    let capacity = f.capacity();
+    c.bench_function("get_ok_medium_75", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let mut n = 0;
+            for _ in 0..100 {
+                n += f.contains(&i) as u64;
+                i = (i + 1) % capacity;
+            }
+            n
+        })
+    });
+}
+
+fn bench_get_nok_medium_75(c: &mut Criterion) {
+    let mut f = Filter::new(100000, 0.01).unwrap();
+    for i in 0..f.capacity() * 3 / 4 {
+        f.insert_duplicated(&i).unwrap();
+    }
+    c.bench_function("get_nok_medium_75", |b| {
+        let mut i = f.capacity();
+        b.iter(|| {
+            let mut n = 0;
+            for _ in 0..100 {
+                n += f.contains(&i) as u64;
+                i = i.wrapping_add(1);
+            }
+            n
+        })
+    });
+}
+
+fn bench_grow(c: &mut Criterion) {
+    c.bench_function("grow", |b| {
+        b.iter(|| {
+            let mut f = Filter::new(10000, 0.01).unwrap();
+            for i in 0..f.capacity() {
+                f.insert_duplicated(i).unwrap();
+            }
+            f
+        })
+    });
+}
+
+fn bench_grow_from_90pct(c: &mut Criterion) {
     let mut f = Filter::new(10000, 0.01).unwrap();
     for i in 0..f.capacity() / 10 * 9 {
         f.insert_duplicated(i).unwrap();
     }
-    b.iter(|| {
-        let mut f = f.clone();
-        for i in f.len()..f.capacity() {
-            f.insert_duplicated(i).unwrap();
-        }
-        f
-    });
-}
-
-#[bench]
-fn bench_grow_resizeable(b: &mut Bencher) {
-    b.iter(|| {
-        let mut f = Filter::new_resizeable(0, 10000, 0.01).unwrap();
-        for i in 0u64.. {
-            if f.insert_duplicated(i).is_err() {
-                break;
+    c.bench_function("grow_from_90pct", |b| {
+        b.iter(|| {
+            let mut f = f.clone();
+            for i in f.len()..f.capacity() {
+                f.insert_duplicated(i).unwrap();
             }
-        }
-        assert_eq!(f.len(), 10000u64.next_power_of_two() * 19 / 20);
-        f
+            f
+        })
     });
 }
 
-#[bench]
-fn bench_shrink(b: &mut Bencher) {
+fn bench_grow_resizeable(c: &mut Criterion) {
+    c.bench_function("grow_resizeable", |b| {
+        b.iter(|| {
+            let mut f = Filter::new_resizeable(0, 10000, 0.01).unwrap();
+            for i in 0u64.. {
+                if f.insert_duplicated(i).is_err() {
+                    break;
+                }
+            }
+            f
+        })
+    });
+}
+
+fn bench_shrink(c: &mut Criterion) {
     let mut f = Filter::new(10000, 0.01).unwrap();
     for i in 0..f.capacity() {
-        let _ = f.insert(i);
+        f.insert_duplicated(i).unwrap();
     }
-    b.iter(|| {
-        let mut f = f.clone();
-        for i in 0..f.capacity() {
-            f.remove(i);
-        }
-        f
+    c.bench_function("shrink", |b| {
+        b.iter(|| {
+            let mut f = f.clone();
+            for i in 0..f.capacity() {
+                f.remove(i);
+            }
+            f
+        })
     });
 }
+
+fn bench_shrink_10pct(c: &mut Criterion) {
+    let mut f = Filter::new(10000, 0.01).unwrap();
+    for i in 0..f.capacity() {
+        f.insert_duplicated(i).unwrap();
+    }
+    c.bench_function("shrink_10pct", |b| {
+        b.iter(|| {
+            let mut f = f.clone();
+            // Remove 10% of items (from 100% to 90% fill)
+            for i in 0..f.capacity() / 10 {
+                f.remove(i);
+            }
+            f
+        })
+    });
+}
+
+fn bench_fingerprints(c: &mut Criterion) {
+    let mut f = Filter::new(100000, 0.01).unwrap();
+    for i in 0..f.capacity() {
+        f.insert_duplicated(&i).unwrap();
+    }
+    c.bench_function("fingerprints", |b| {
+        b.iter(|| {
+            assert_eq!(f.fingerprints().count(), f.capacity() as usize);
+        })
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_new,
+    bench_get_ok_medium,
+    bench_get_nok_medium,
+    bench_get_ok_medium_75,
+    bench_get_nok_medium_75,
+    bench_grow,
+    bench_grow_from_90pct,
+    bench_grow_resizeable,
+    bench_shrink,
+    bench_shrink_10pct,
+    bench_fingerprints,
+);
+criterion_main!(benches);

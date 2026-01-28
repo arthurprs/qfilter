@@ -44,14 +44,23 @@
 //! | 17.125 | 2.75e-05 | .. | .. |
 //! | 18.125 | 1.37e-05 | .. | .. |
 //!
+//! ### Performance
+//!
+//! - **Lookup/Insert/Delete**: O(1) expected case, O(n) worst case with pathological hash collisions
+//! - **Memory overhead**: 2.125 bits per slot for metadata (occupieds, runends, offset)
+//! - **Cache efficiency**: Block-based layout with 64-slot blocks improves cache locality
+//!
+//! Performance degrades gracefully as occupancy increases. The filter automatically
+//! limits occupancy to 95% to maintain good performance.
+//!
 //! ### Legacy x86_64 CPUs support
 //!
-//! The implementation assumes the `popcnt` instruction (equivalent to `integer.count_ones()`) is present
-//! when compiling for x86_64 targets. This is theoretically not guaranteed as the instruction in only
-//! available on AMD/Intel CPUs released after 2007/2008. If that's not the case the Filter constructor will panic.
+//! The implementation assumes `popcnt` and BMI2 (`pdep`, `tzcnt`) instructions are available
+//! when compiling for x86_64 targets. These instructions are available on CPUS released after 2015.
+//! If they are not available, the Filter constructor will panic.
 //!
-//! Support for such legacy x86_64 CPUs can be optionally enabled with the `legacy_x86_64_support`
-//! which incurs a ~10% performance penalty.
+//! The `legacy_x86_64_support` feature enables support for older x86_64 CPUs by using
+//! portable fallbacks.
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use std::{
@@ -67,7 +76,163 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use stable_hasher::StableHasher;
 
+mod portable_select;
 mod stable_hasher;
+
+/// Computes a truncated fingerprint for the given item.
+///
+/// Uses the same stable hash algorithm (xxhash3) as [`Filter`].
+/// Only the lower `fingerprint_bits` bits of the hash are returned.
+///
+/// - `fingerprint_bits == 0` returns `0`
+/// - `fingerprint_bits >= 64` returns the full 64-bit hash
+///
+/// # Example
+///
+/// ```rust
+/// use qfilter::{compute_fingerprint, Filter};
+///
+/// let mut filter = Filter::new(100, 0.01).unwrap();
+/// filter.insert("hello").unwrap();
+/// let fp = compute_fingerprint("hello", filter.fingerprint_size());
+/// assert!(filter.contains_fingerprint(fp));
+/// ```
+#[inline]
+pub fn compute_fingerprint<T: Hash>(item: T, fingerprint_bits: u8) -> u64 {
+    let mut hasher = StableHasher::new();
+    item.hash(&mut hasher);
+    let hash = hasher.finish();
+    if fingerprint_bits >= 64 {
+        hash
+    } else {
+        hash & ((1u64 << fingerprint_bits) - 1)
+    }
+}
+
+/// Specifications for a filter with given parameters.
+///
+/// Returned by [`filter_specs()`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilterSpecs {
+    /// Actual maximum capacity (may be higher than requested due to rounding).
+    pub max_capacity: u64,
+    /// Maximum false positive rate when at capacity (may be lower than requested due to rounding).
+    pub max_error_ratio: f64,
+    /// Storage cost per item in bits when at max capacity (remainder bits + 2.125 metadata overhead).
+    pub bits_per_item: f64,
+    /// Memory usage in bytes at minimum capacity (smallest resizable filter).
+    pub memory_bytes_min: usize,
+    /// Memory usage in bytes at maximum capacity.
+    pub memory_bytes_max: usize,
+    /// Internal fingerprint size in bits.
+    ///
+    /// This is an implementation detail exposed for advanced use cases like
+    /// pre-computing fingerprints with [`compute_fingerprint()`]. It represents
+    /// the full hash width (qbits + rbits), not the storage cost per item.
+    pub fingerprint_bits: u8,
+}
+
+/// Computes filter specifications for a given capacity and false positive rate.
+///
+/// Returns the fingerprint size and memory usage bounds, useful for planning
+/// memory allocation or pre-computing fingerprints before creating a filter.
+///
+/// # Parameters
+///
+/// - `capacity`: The number of items the filter should hold.
+/// - `fp_rate`: Upper bound on false positive probability (clamped to (0, 0.5]).
+///   The actual rate may be lower due to internal rounding.
+///
+/// # Errors
+///
+/// - [`Error::CapacityTooLarge`] if capacity exceeds [`Filter::MAX_CAPACITY`].
+/// - [`Error::NotEnoughFingerprintBits`] if the configuration requires more than 64 bits.
+///
+/// # Example
+///
+/// ```rust
+/// use qfilter::{filter_specs, compute_fingerprint, Filter};
+///
+/// let capacity = 10000;
+/// let fp_rate = 0.01;
+///
+/// // Get filter specifications
+/// let specs = filter_specs(capacity, fp_rate).unwrap();
+///
+/// // Pre-compute fingerprints using the fingerprint size
+/// let fingerprints: Vec<u64> = (0..100)
+///     .map(|i| compute_fingerprint(i, specs.fingerprint_bits))
+///     .collect();
+///
+/// // Memory will be between min and max depending on how the filter grows
+/// let filter = Filter::new(capacity, fp_rate).unwrap();
+/// assert_eq!(filter.fingerprint_size(), specs.fingerprint_bits);
+/// assert_eq!(filter.memory_usage(), specs.memory_bytes_max);
+/// ```
+pub fn filter_specs(capacity: u64, fp_rate: f64) -> Result<FilterSpecs, Error> {
+    let slots = calculate_needed_slots(capacity)?;
+    let qbits = slots.trailing_zeros() as u8;
+    let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
+    let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8;
+    let fingerprint_bits = qbits + rbits;
+    if fingerprint_bits > 64 {
+        return Err(Error::NotEnoughFingerprintBits);
+    }
+
+    let memory_bytes_max = calculate_memory_bytes(qbits, rbits);
+    // Smallest resizable filter has 64 slots (qbits=6)
+    let memory_bytes_min = calculate_memory_bytes(6, fingerprint_bits - 6);
+    // Max capacity: 95% of slots
+    let capacity = (slots * 19).div_ceil(20);
+    // Max capacity error ratio based on rbits
+    let max_error_ratio = 2f64.powi(-(rbits as i32));
+    // Storage cost per item: remainder bits + metadata overhead
+    let bits_per_item = rbits as f64 + 2.125;
+
+    Ok(FilterSpecs {
+        fingerprint_bits,
+        memory_bytes_min,
+        memory_bytes_max,
+        max_capacity: capacity,
+        max_error_ratio,
+        bits_per_item,
+    })
+}
+
+/// Calculates memory usage in bytes for a filter with given qbits and rbits.
+///
+/// Memory layout per block (64 slots):
+/// - 1 byte: offset
+/// - 8 bytes: occupieds bitmap
+/// - 8 bytes: runends bitmap
+/// - 8 * rbits bytes: remainders (64 slots * rbits bits / 8)
+///
+/// Total: num_blocks * (17 + 8 * rbits) + 8 bytes padding.
+/// The +8 padding allows branchless remainder reads (always reading 2 u64s).
+fn calculate_memory_bytes(qbits: u8, rbits: u8) -> usize {
+    let num_blocks = (1u64 << qbits) / 64;
+    let block_bytes = 17 + 8 * rbits as u64;
+    (num_blocks * block_bytes + 8) as usize
+}
+
+/// Calculates the number of slots needed to fit the desired capacity with 95% max occupancy.
+/// Returns the number of slots rounded to the next power of two, but always >= 64.
+fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
+    let mut slots = desired
+        .checked_next_power_of_two()
+        .ok_or(Error::CapacityTooLarge)?
+        .max(64);
+    loop {
+        let capacity = slots
+            .checked_mul(19)
+            .ok_or(Error::CapacityTooLarge)?
+            .div_ceil(20);
+        if capacity >= desired {
+            return Ok(slots);
+        }
+        slots = slots.checked_mul(2).ok_or(Error::CapacityTooLarge)?;
+    }
+}
 
 /// Approximate Membership Query Filter (AMQ-Filter) based on the Rank Select Quotient Filter (RSQF).
 ///
@@ -99,23 +264,21 @@ pub struct Filter {
     qbits: NonZeroU8,
     #[cfg_attr(feature = "serde", serde(rename = "r"))]
     rbits: NonZeroU8,
-    #[cfg_attr(
-        feature = "serde",
-        serde(rename = "g", skip_serializing_if = "Option::is_none", default)
-    )]
+    #[cfg_attr(feature = "serde", serde(rename = "m"))]
     max_qbits: Option<NonZeroU8>,
 }
 
+/// Errors returned by [`Filter`] operations.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// The filter cannot fit another fingerprint
+    /// The filter is full and cannot grow further.
     CapacityExceeded,
-    /// The fingerprint sizes are not compatible
+    /// Filters have incompatible fingerprint sizes (e.g., during [`Filter::merge()`]).
     IncompatibleFingerprintSize,
-    /// The specified filter cannot be constructed with 64 bit hashes
+    /// The requested configuration requires more than 64 bits per fingerprint.
     NotEnoughFingerprintBits,
-    /// Capacity is too large. Filter::MAX_CAPACITY = 2^59 * 19 / 20.
+    /// The requested capacity exceeds [`Filter::MAX_CAPACITY`].
     CapacityTooLarge,
 }
 
@@ -173,9 +336,13 @@ impl BitExt for u64 {
 
     #[inline]
     fn shift_right(&self, bits: usize, b: &Self, b_start: usize, b_end: usize) -> Self {
-        let bitmask = |n| !u64::MAX.checked_shl(n).unwrap_or(0);
         let a_component = *self >> (64 - bits); // select the highest `bits` from A to become lowest
-        let b_shifted_mask = bitmask((b_end - b_start) as u32) << b_start;
+        let width = b_end - b_start;
+        let b_shifted_mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        } << b_start;
         let b_shifted = ((b_shifted_mask & b) << bits) & b_shifted_mask;
         let b_mask = !b_shifted_mask;
 
@@ -184,9 +351,13 @@ impl BitExt for u64 {
 
     #[inline]
     fn shift_left(&self, bits: usize, b: &Self, b_start: usize, b_end: usize) -> Self {
-        let bitmask = |n| !u64::MAX.checked_shl(n).unwrap_or(0);
         let a_component = *self << (64 - bits); // select the lowest `bits` from A to become highest
-        let b_shifted_mask = bitmask((b_end - b_start) as u32) << b_start;
+        let width = b_end - b_start;
+        let b_shifted_mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        } << b_start;
         let b_shifted = ((b_shifted_mask & b) >> bits) & b_shifted_mask;
         let b_mask = !b_shifted_mask;
 
@@ -196,13 +367,13 @@ impl BitExt for u64 {
     #[inline]
     fn popcnt(&self, range: impl RangeBounds<u64>) -> u64 {
         let mut v = match range.start_bound() {
-            std::ops::Bound::Included(&i) => *self >> i << i,
-            std::ops::Bound::Excluded(&i) => *self >> (i + 1) << (i + 1),
+            std::ops::Bound::Included(&i) => *self & (u64::MAX << i),
+            std::ops::Bound::Excluded(&i) => *self & (u64::MAX << (i + 1)),
             _ => *self,
         };
         v = match range.end_bound() {
-            std::ops::Bound::Included(&i) if i < 63 => v & ((2 << i) - 1),
-            std::ops::Bound::Excluded(&i) if i <= 63 => v & ((1 << i) - 1),
+            std::ops::Bound::Included(&i) => v & (u64::MAX >> (63 - i)),
+            std::ops::Bound::Excluded(&i) => v & ((1u64 << i) - 1),
             _ => v,
         };
 
@@ -239,72 +410,40 @@ impl BitExt for u64 {
     #[inline]
     fn select(&self, range: RangeFrom<u64>, n: u64) -> Option<u64> {
         debug_assert!(range.start < 64);
-        let v = *self >> range.start << range.start;
+        let v = *self & (u64::MAX << range.start);
 
-        #[cfg_attr(target_arch = "x86_64", cold)]
-        #[cfg_attr(not(target_arch = "x86_64"), inline)]
-        fn fallback(mut v: u64, n: u64) -> Option<u64> {
-            for _ in 0..n / 8 {
-                for _ in 0..8 {
-                    v &= v.wrapping_sub(1); // remove the least significant bit
-                }
-            }
-            for _ in 0..n % 8 {
-                v &= v.wrapping_sub(1); // remove the least significant bit
-            }
-
-            if v == 0 {
-                None
+        // x86_64: use BMI2 (assumed at runtime, or guaranteed at compile time)
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(not(feature = "legacy_x86_64_support"), target_feature = "bmi2")
+        ))]
+        unsafe {
+            let result: u64;
+            std::arch::asm!(
+                "mov     {tmp}, 1",
+                "shlx    {tmp}, {tmp}, {n}",
+                "pdep    {tmp}, {tmp}, {v}",
+                "tzcnt   {tmp}, {tmp}",
+                n = in(reg) n,
+                v = in(reg) v,
+                tmp = out(reg) result,
+                options(pure, nomem, nostack)
+            );
+            if result != 64 {
+                Some(result)
             } else {
-                Some(v.trailing_zeros() as u64)
+                None
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
-        let result = {
-            // TODO: AMD CPUs up to Zen2 have slow BMI implementations
-            if std::is_x86_feature_detected!("bmi2") {
-                // This is the equivalent intrinsics version of the inline assembly below.
-                // #[target_feature(enable = "bmi1")]
-                // #[target_feature(enable = "bmi2")]
-                // #[inline]
-                // unsafe fn select_bmi2(x: u64, k: u64) -> Option<u64> {
-                //     use std::arch::x86_64::{_pdep_u64, _tzcnt_u64};
-                //     let result = _tzcnt_u64(_pdep_u64(1 << k, x));
-                //     if result != 64 {
-                //         Some(result)
-                //     } else {
-                //         None
-                //     }
-                // }
-                // unsafe { select_bmi2(v, n) }
-
-                let result: u64;
-                unsafe {
-                    std::arch::asm!(
-                        "mov     {tmp}, 1",
-                        "shlx    {tmp}, {tmp}, {n}",
-                        "pdep    {tmp}, {tmp}, {v}",
-                        "tzcnt   {tmp}, {tmp}",
-                        n = in(reg) n,
-                        v = in(reg) v,
-                        tmp = out(reg) result,
-                        options(pure, nomem, nostack)
-                    );
-                }
-                if result != 64 {
-                    Some(result)
-                } else {
-                    None
-                }
-            } else {
-                fallback(v, n)
-            }
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let result = fallback(v, n);
-
-        result
+        // Fallback: non-x86_64 or legacy without BMI2
+        #[cfg(not(all(
+            target_arch = "x86_64",
+            any(not(feature = "legacy_x86_64_support"), target_feature = "bmi2")
+        )))]
+        {
+            crate::portable_select::select(v, n)
+        }
     }
 }
 
@@ -325,55 +464,120 @@ impl CastNonZeroU8 for NonZeroU8 {
     }
 }
 
-/// An iterator over the fingerprints of a `Filter`.
+/// An iterator over the fingerprints stored in a [`Filter`].
+///
+/// Fingerprints are yielded in ascending order. Each value is a `u64` where only
+/// the lower [`Filter::fingerprint_size()`] bits are meaningful (upper bits are zero).
+///
+/// If duplicates were inserted, the same fingerprint value may be yielded multiple times.
+///
+/// Created by [`Filter::fingerprints()`].
 pub struct FingerprintIter<'a> {
     filter: &'a Filter,
     q_bucket_idx: u64,
     r_bucket_idx: u64,
     remaining: u64,
+    q_block_idx: u64,
+    r_block_idx: u64,
+    cached_occupieds: u64,
+    cached_runends: u64,
 }
 
 impl<'a> FingerprintIter<'a> {
     fn new(filter: &'a Filter) -> Self {
-        let mut iter = FingerprintIter {
-            filter,
-            q_bucket_idx: 0,
-            r_bucket_idx: 0,
-            remaining: filter.len,
-        };
+        let mut q_block_idx = 0u64;
+        let mut cached_occupieds = filter.raw_block(0).occupieds;
         if !filter.is_empty() {
-            while !filter.is_occupied(iter.q_bucket_idx) {
-                iter.q_bucket_idx += 1;
+            while cached_occupieds == 0 {
+                q_block_idx += 1;
+                cached_occupieds = filter.raw_block(q_block_idx).occupieds;
             }
-            iter.r_bucket_idx = filter.run_start(iter.q_bucket_idx);
         }
-        iter
+        let q_bucket_idx = q_block_idx * 64 + cached_occupieds.trailing_zeros() as u64;
+        let r_bucket_idx = filter.run_start(q_bucket_idx);
+        let r_block_idx = r_bucket_idx / 64;
+        let cached_runends = filter.raw_block(r_block_idx).runends;
+
+        Self {
+            filter,
+            q_bucket_idx,
+            r_bucket_idx,
+            remaining: filter.len,
+            q_block_idx,
+            r_block_idx,
+            cached_occupieds,
+            cached_runends,
+        }
     }
 }
 
 impl Iterator for FingerprintIter<'_> {
     type Item = u64;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(r) = self.remaining.checked_sub(1) {
-            self.remaining = r;
-        } else {
-            return None;
-        }
+        self.remaining = self.remaining.checked_sub(1)?;
+
         let hash = (self.q_bucket_idx << self.filter.rbits.get())
             | self.filter.get_remainder(self.r_bucket_idx);
 
-        if self.filter.is_runend(self.r_bucket_idx) {
+        let is_runend = self
+            .cached_runends
+            .is_bit_set((self.r_bucket_idx % 64) as usize);
+        if is_runend {
+            // Move to next occupied quotient bucket
             self.q_bucket_idx += 1;
-            while !self.filter.is_occupied(self.q_bucket_idx) {
-                self.q_bucket_idx += 1;
+            if self.q_bucket_idx / 64 != self.q_block_idx {
+                self.q_block_idx = self.q_bucket_idx / 64;
+                self.cached_occupieds = self.filter.raw_block(self.q_block_idx).occupieds;
             }
+
+            // Find next occupied using trailing_zeros
+            let mut masked = self.cached_occupieds & (u64::MAX << (self.q_bucket_idx % 64));
+            while masked == 0 {
+                self.q_block_idx += 1;
+                self.cached_occupieds = self.filter.raw_block(self.q_block_idx).occupieds;
+                masked = self.cached_occupieds;
+            }
+            self.q_bucket_idx = self.q_block_idx * 64 + masked.trailing_zeros() as u64;
             self.r_bucket_idx = (self.r_bucket_idx + 1).max(self.q_bucket_idx);
         } else {
             self.r_bucket_idx += 1;
         }
 
+        // Update runends cache if needed
+        if self.r_bucket_idx / 64 != self.r_block_idx {
+            self.r_block_idx = self.r_bucket_idx / 64;
+            self.cached_runends = self.filter.raw_block(self.r_block_idx).runends;
+        }
+
         Some(hash)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (
+            self.remaining.try_into().unwrap_or(usize::MAX),
+            self.remaining.try_into().ok(),
+        )
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl ExactSizeIterator for FingerprintIter<'_> {}
+
+impl std::iter::FusedIterator for FingerprintIter<'_> {}
+
+impl<'a> IntoIterator for &'a Filter {
+    type Item = u64;
+    type IntoIter = FingerprintIter<'a>;
+
+    /// Returns an iterator over the fingerprints stored in the filter.
+    ///
+    /// Equivalent to calling [`Filter::fingerprints()`].
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.fingerprints()
     }
 }
 
@@ -385,53 +589,48 @@ impl Filter {
     /// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
     pub const MAX_CAPACITY: u64 = (2u64.pow(Self::MAX_QBITS as u32) * 19).div_ceil(20);
 
-    /// Creates a new filter that can hold at least `capacity` items
-    /// and with a desired error rate of `fp_rate` (clamped to (0, 0.5]).
+    /// Creates a new filter with the given capacity and false positive rate.
     ///
-    /// Errors if capacity is too large if the specified filter isn't achievable using 64 bit hashes.
+    /// # Parameters
+    ///
+    /// - `capacity`: Minimum number of items the filter can hold.
+    /// - `fp_rate`: Upper bound on false positive probability (clamped to (0, 0.5]).
+    ///   The actual rate may be lower due to internal rounding.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::CapacityTooLarge`] if capacity exceeds [`Self::MAX_CAPACITY`].
+    /// - [`Error::NotEnoughFingerprintBits`] if the configuration isn't achievable.
     #[inline]
     pub fn new(capacity: u64, fp_rate: f64) -> Result<Self, Error> {
         Self::new_resizeable(capacity, capacity, fp_rate)
     }
 
-    /// Calculates the number of slots needed to fit the desired fingerprints with 95% occupation.
-    /// Returns the number of slots needed rounded to the next power of two, but always >= 64.
-    fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
-        let mut slots = desired
-            .checked_next_power_of_two()
-            .ok_or(Error::CapacityTooLarge)?
-            .max(64);
-        loop {
-            let capacity = slots
-                .checked_mul(19)
-                .ok_or(Error::CapacityTooLarge)?
-                .div_ceil(20);
-            if capacity >= desired {
-                return Ok(slots);
-            }
-            slots = slots.checked_mul(2).ok_or(Error::CapacityTooLarge)?;
-        }
-    }
-
-    /// Creates a new filter that can hold at least `initial_capacity` items initially
-    /// and can resize to hold at least `max_capacity` when fully grown.
-    /// The desired error rate `fp_rate` (clamped to (0, 0.5]) applies to the fully grown filter.
+    /// Creates a resizeable filter that can grow from `initial_capacity` to `max_capacity`.
     ///
-    /// This works by storing fingerprints large enough to satisfy the maximum requirements,
-    /// so smaller filters will actually have lower error rates, which will increase
-    /// (up to `fp_rate`) as the filter grows. In practice every time the filter doubles in
-    /// capacity its error rate also doubles.
+    /// The filter starts small and automatically grows when full. The `fp_rate` applies
+    /// at `max_capacity`; smaller sizes have proportionally lower error rates.
     ///
-    /// Errors if max_capacity is too large or if the specified filter isn't achievable using 64 bit hashes.
+    /// # Parameters
+    ///
+    /// - `initial_capacity`: Starting capacity.
+    /// - `max_capacity`: Maximum capacity after growth (must be >= `initial_capacity`).
+    /// - `fp_rate`: Upper bound on false positive rate at max capacity (clamped to (0, 0.5]).
+    ///   The actual rate may be lower due to internal rounding.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::CapacityTooLarge`] if `max_capacity` exceeds [`Self::MAX_CAPACITY`].
+    /// - [`Error::NotEnoughFingerprintBits`] if the configuration isn't achievable.
     pub fn new_resizeable(
         initial_capacity: u64,
         max_capacity: u64,
         fp_rate: f64,
     ) -> Result<Self, Error> {
         assert!(max_capacity >= initial_capacity);
-        let slots_for_capacity = Self::calculate_needed_slots(initial_capacity)?;
+        let slots_for_capacity = calculate_needed_slots(initial_capacity)?;
         let qbits = slots_for_capacity.trailing_zeros() as u8;
-        let slots_for_max_capacity = Self::calculate_needed_slots(max_capacity)?;
+        let slots_for_max_capacity = calculate_needed_slots(max_capacity)?;
         let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
         let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
         let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8 + (max_qbits - qbits);
@@ -442,9 +641,20 @@ impl Filter {
         Ok(result)
     }
 
-    /// Creates a new resizeable filter that can hold at least `initial_capacity` items initially while
-    /// utilizing a fingerprint bit size of `fingerprint_bits` (7..=64). Normally this function is only
-    /// useful if the filter is being used to manually store fingerprints.
+    /// Creates a new resizeable filter with a specific fingerprint bit size.
+    ///
+    /// Use this when storing pre-computed fingerprints via [`Self::insert_fingerprint()`].
+    /// Use [`compute_fingerprint()`] to compute fingerprints with a specific bit size.
+    ///
+    /// # Parameters
+    ///
+    /// - `initial_capacity`: Minimum number of items the filter can hold initially.
+    /// - `fingerprint_bits`: Bits per fingerprint (7..=64). Larger values reduce false positives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotEnoughFingerprintBits`] if `fingerprint_bits` is outside 7..=64
+    /// or too small for the requested capacity.
     pub fn with_fingerprint_size(
         initial_capacity: u64,
         fingerprint_bits: u8,
@@ -452,7 +662,7 @@ impl Filter {
         if !(7..=64).contains(&fingerprint_bits) {
             return Err(Error::NotEnoughFingerprintBits);
         }
-        let slots_for_capacity = Self::calculate_needed_slots(initial_capacity)?;
+        let slots_for_capacity = calculate_needed_slots(initial_capacity)?;
         let qbits = slots_for_capacity.trailing_zeros() as u8;
         if fingerprint_bits <= qbits {
             return Err(Error::NotEnoughFingerprintBits);
@@ -470,12 +680,8 @@ impl Filter {
         if qbits.get() + rbits.get() > 64 {
             return Err(Error::NotEnoughFingerprintBits);
         }
-        let num_slots = 1 << qbits.get();
-        let num_blocks = num_slots / 64;
-        assert_ne!(num_blocks, 0);
-        let block_bytes_size = 1 + 16 + 64 * rbits.u64() / 8;
-        let buffer_bytes = num_blocks * block_bytes_size;
-        let buffer = vec![0u8; buffer_bytes.try_into().unwrap()].into_boxed_slice();
+        let buffer_bytes = calculate_memory_bytes(qbits.get(), rbits.get());
+        let buffer = vec![0u8; buffer_bytes].into_boxed_slice();
         Ok(Self {
             buffer,
             qbits,
@@ -495,46 +701,57 @@ impl Filter {
             std::is_x86_feature_detected!("popcnt"),
             "CPU doesn't support the popcnt instruction"
         );
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(feature = "legacy_x86_64_support"),
+            not(target_feature = "bmi2")
+        ))]
+        assert!(
+            std::is_x86_feature_detected!("bmi2"),
+            "CPU doesn't support the bmi2 instructions"
+        );
     }
 
-    /// The internal fingerprint size in bits.
+    /// Returns the fingerprint size in bits.
+    ///
+    /// Use this with [`compute_fingerprint()`] to create compatible fingerprints.
     #[inline]
     pub fn fingerprint_size(&self) -> u8 {
         self.qbits.get() + self.rbits.get()
     }
 
-    /// Whether the filter is empty.
+    /// Returns `true` if the filter contains no items.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Current number of fingerprints admitted to the filter.
+    /// Returns the number of items in the filter.
     #[inline]
     pub fn len(&self) -> u64 {
         self.len
     }
 
-    /// Current memory usage in bytes.
+    /// Returns the memory usage in bytes.
     #[inline]
     pub fn memory_usage(&self) -> usize {
         self.buffer.len()
     }
 
-    /// Resets/Clears the filter.
+    /// Removes all items from the filter.
     pub fn clear(&mut self) {
         self.buffer.fill(0);
         self.len = 0;
     }
 
-    /// Maximum filter capacity.
+    /// Returns the maximum capacity after all possible growth.
     #[inline]
-    pub fn capacity_resizeable(&self) -> u64 {
+    pub fn max_capacity(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
         ((1u64 << self.max_qbits.unwrap_or(self.qbits).get()) * 19).div_ceil(20)
     }
 
-    /// Current filter capacity.
+    /// Returns the current capacity (before next growth).
     #[inline]
     pub fn capacity(&self) -> u64 {
         if cfg!(fuzzing) {
@@ -549,18 +766,18 @@ impl Filter {
         }
     }
 
-    /// Max error ratio when at the resizeable capacity (len == resizeable_capacity).
+    /// Returns the false positive rate when fully grown (`len == max_capacity()`).
     pub fn max_error_ratio_resizeable(&self) -> f64 {
         let extra_rbits = self.max_qbits.unwrap_or(self.qbits).get() - self.qbits.get();
         2f64.powi(-((self.rbits.get() - extra_rbits) as i32))
     }
 
-    /// Max error ratio when at full capacity (len == capacity).
+    /// Returns the false positive rate at current capacity (`len == capacity()`).
     pub fn max_error_ratio(&self) -> f64 {
         2f64.powi(-(self.rbits.get() as i32))
     }
 
-    /// Current error ratio at the current occupancy.
+    /// Returns the estimated false positive rate at current occupancy.
     pub fn current_error_ratio(&self) -> f64 {
         let occupancy = self.len as f64 / self.total_buckets().get() as f64;
         1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits.get() as i32))
@@ -575,42 +792,44 @@ impl Filter {
     fn set_block_runends(&mut self, block_num: u64, runends: u64) {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
-        let block_bytes: &mut [u8; 1 + 8 + 8] = (&mut self.buffer[block_start..][..1 + 8 + 8])
-            .try_into()
-            .unwrap();
-        block_bytes[1 + 8..1 + 8 + 8].copy_from_slice(&runends.to_le_bytes());
+        // SAFETY: block_num % total_blocks() guarantees valid block index
+        unsafe { self.write_u64_unchecked(block_start + 1 + 8, runends) };
+    }
+
+    /// Read u64 from buffer at given offset without bounds checking.
+    /// SAFETY: Caller must ensure offset + 8 <= buffer.len()
+    #[inline(always)]
+    unsafe fn read_u64_unchecked(&self, offset: usize) -> u64 {
+        debug_assert!(offset + 8 <= self.buffer.len());
+        u64::from_le_bytes(
+            self.buffer
+                .get_unchecked(offset..offset + 8)
+                .try_into()
+                .unwrap_unchecked(),
+        )
+    }
+
+    /// Write u64 to buffer at given offset without bounds checking.
+    /// SAFETY: Caller must ensure offset + 8 <= buffer.len()
+    #[inline(always)]
+    unsafe fn write_u64_unchecked(&mut self, offset: usize, value: u64) {
+        debug_assert!(offset + 8 <= self.buffer.len());
+        self.buffer
+            .get_unchecked_mut(offset..offset + 8)
+            .copy_from_slice(&value.to_le_bytes());
     }
 
     #[inline]
     fn raw_block(&self, block_num: u64) -> Block {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
-        let block_bytes: &[u8; 1 + 8 + 8] =
-            &self.buffer[block_start..][..1 + 8 + 8].try_into().unwrap();
-        Block {
-            offset: block_bytes[0] as u64,
-            occupieds: u64::from_le_bytes(block_bytes[1..1 + 8].try_into().unwrap()),
-            runends: u64::from_le_bytes(block_bytes[1 + 8..1 + 8 + 8].try_into().unwrap()),
-        }
-    }
-
-    #[inline]
-    fn block(&self, block_num: u64) -> Block {
-        let block_num = block_num % self.total_blocks();
-        let block_start = block_num as usize * self.block_byte_size();
-        let block_bytes: &[u8; 1 + 8 + 8] =
-            &self.buffer[block_start..][..1 + 8 + 8].try_into().unwrap();
-        let offset = {
-            if block_bytes[0] < u8::MAX {
-                block_bytes[0] as u64
-            } else {
-                self.calc_offset(block_num)
+        // SAFETY: block_num % total_blocks() guarantees valid block index
+        unsafe {
+            Block {
+                offset: *self.buffer.get_unchecked(block_start) as u64,
+                occupieds: self.read_u64_unchecked(block_start + 1),
+                runends: self.read_u64_unchecked(block_start + 1 + 8),
             }
-        };
-        Block {
-            offset,
-            occupieds: u64::from_le_bytes(block_bytes[1..1 + 8].try_into().unwrap()),
-            runends: u64::from_le_bytes(block_bytes[1 + 8..1 + 8 + 8].try_into().unwrap()),
         }
     }
 
@@ -618,14 +837,16 @@ impl Filter {
     fn adjust_block_offset(&mut self, block_num: u64, inc: bool) {
         let block_num = block_num % self.total_blocks();
         let block_start = block_num as usize * self.block_byte_size();
-        let offset = &mut self.buffer[block_start];
-        if inc {
-            *offset = offset.saturating_add(1);
-        } else if *offset != u8::MAX {
-            *offset -= 1;
+        // SAFETY: block_num % total_blocks() guarantees valid block index
+        let current = unsafe { *self.buffer.get_unchecked(block_start) };
+        let new_value = if inc {
+            current.saturating_add(1)
+        } else if current != u8::MAX {
+            current - 1
         } else {
-            self.buffer[block_start] = self.calc_offset(block_num).try_into().unwrap_or(u8::MAX);
-        }
+            self.calc_offset(block_num).try_into().unwrap_or(u8::MAX)
+        };
+        unsafe { *self.buffer.get_unchecked_mut(block_start) = new_value };
     }
 
     #[inline]
@@ -689,7 +910,8 @@ impl Filter {
     fn is_occupied(&self, hash_bucket_idx: u64) -> bool {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let occupieds = u64::from_le_bytes(self.buffer[block_start + 1..][..8].try_into().unwrap());
+        // SAFETY: hash_bucket_idx % total_buckets() guarantees valid block index
+        let occupieds = unsafe { self.read_u64_unchecked(block_start + 1) };
         occupieds.is_bit_set((hash_bucket_idx % 64) as usize)
     }
 
@@ -697,18 +919,18 @@ impl Filter {
     fn set_occupied(&mut self, hash_bucket_idx: u64, value: bool) {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let mut occupieds =
-            u64::from_le_bytes(self.buffer[block_start + 1..][..8].try_into().unwrap());
+        // SAFETY: hash_bucket_idx % total_buckets() guarantees valid block index
+        let mut occupieds = unsafe { self.read_u64_unchecked(block_start + 1) };
         occupieds.update_bit((hash_bucket_idx % 64) as usize, value);
-        self.buffer[block_start + 1..][..8].copy_from_slice(&occupieds.to_le_bytes());
+        unsafe { self.write_u64_unchecked(block_start + 1, occupieds) };
     }
 
     #[inline(always)]
     fn is_runend(&self, hash_bucket_idx: u64) -> bool {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let runends =
-            u64::from_le_bytes(self.buffer[block_start + 1 + 8..][..8].try_into().unwrap());
+        // SAFETY: hash_bucket_idx % total_buckets() guarantees valid block index
+        let runends = unsafe { self.read_u64_unchecked(block_start + 1 + 8) };
         runends.is_bit_set((hash_bucket_idx % 64) as usize)
     }
 
@@ -716,10 +938,10 @@ impl Filter {
     fn set_runend(&mut self, hash_bucket_idx: u64, value: bool) {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let block_start = (hash_bucket_idx / 64) as usize * self.block_byte_size();
-        let mut runends =
-            u64::from_le_bytes(self.buffer[block_start + 1 + 8..][..8].try_into().unwrap());
+        // SAFETY: hash_bucket_idx % total_buckets() guarantees valid block index
+        let mut runends = unsafe { self.read_u64_unchecked(block_start + 1 + 8) };
         runends.update_bit((hash_bucket_idx % 64) as usize, value);
-        self.buffer[block_start + 1 + 8..][..8].copy_from_slice(&runends.to_le_bytes());
+        unsafe { self.write_u64_unchecked(block_start + 1 + 8, runends) };
     }
 
     #[inline(always)]
@@ -728,21 +950,17 @@ impl Filter {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let remainders_start = (hash_bucket_idx / 64) as usize * self.block_byte_size() + 1 + 8 + 8;
         let start_bit_idx = self.rbits.usize() * (hash_bucket_idx % 64) as usize;
-        let end_bit_idx = start_bit_idx + self.rbits.usize();
         let start_u64 = start_bit_idx / 64;
-        let num_rem_parts = 1 + (end_bit_idx > (start_u64 + 1) * 64) as usize;
-        let rem_parts_bytes = &self.buffer[remainders_start + start_u64 * 8..][..num_rem_parts * 8];
         let extra_low = start_bit_idx - start_u64 * 64;
-        let extra_high = ((start_u64 + 1) * 64).saturating_sub(end_bit_idx);
-        let rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
-        // zero high bits & truncate low bits
-        let mut remainder = (rem_part << extra_high) >> (extra_high + extra_low);
-        if let Some(rem_part) = rem_parts_bytes.get(8..16) {
-            let remaining_bits = end_bit_idx - (start_u64 + 1) * 64;
-            let rem_part = u64::from_le_bytes(rem_part.try_into().unwrap());
-            remainder |=
-                (rem_part & !(u64::MAX << remaining_bits)) << (self.rbits.usize() - remaining_bits);
-        }
+
+        // SAFETY: Always safe due to 8 extra bytes padding at end of buffer
+        let rem_part0 = unsafe { self.read_u64_unchecked(remainders_start + start_u64 * 8) };
+        let rem_part1 = unsafe { self.read_u64_unchecked(remainders_start + (start_u64 + 1) * 8) };
+
+        // Combine as 128-bit value and shift to extract the remainder bits (branchless)
+        let combined = (rem_part0 as u128) | ((rem_part1 as u128) << 64);
+        let remainder = (combined >> extra_low) as u64 & ((1u64 << self.rbits.get()) - 1);
+
         debug_assert!(remainder.leading_zeros() >= 64 - self.rbits.get() as u32);
         remainder
     }
@@ -754,106 +972,141 @@ impl Filter {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let remainders_start = (hash_bucket_idx / 64) as usize * self.block_byte_size() + 1 + 8 + 8;
         let start_bit_idx = self.rbits.usize() * (hash_bucket_idx % 64) as usize;
-        let end_bit_idx = start_bit_idx + self.rbits.usize();
         let start_u64 = start_bit_idx / 64;
-        let num_rem_parts = 1 + (end_bit_idx > (start_u64 + 1) * 64) as usize;
-        let rem_parts_bytes =
-            &mut self.buffer[remainders_start + start_u64 * 8..][..num_rem_parts * 8];
-        let mut rem_part = u64::from_le_bytes(rem_parts_bytes[..8].try_into().unwrap());
         let extra_low = start_bit_idx - start_u64 * 64;
-        let extra_high = ((start_u64 + 1) * 64).saturating_sub(end_bit_idx);
-        // zero region we'll copy remainder bits in
-        rem_part &= !((u64::MAX << extra_low) & (u64::MAX >> extra_high));
-        let low_bits_to_copy = 64 - extra_high - extra_low;
-        rem_part |= (remainder & !(u64::MAX << low_bits_to_copy)) << extra_low;
-        rem_parts_bytes[..8].copy_from_slice(&rem_part.to_le_bytes());
-        if rem_parts_bytes.len() < 16 {
-            return;
+
+        // SAFETY: Always safe due to 8 extra bytes padding at end of buffer
+        let offset = remainders_start + start_u64 * 8;
+        let rem_part0 = unsafe { self.read_u64_unchecked(offset) };
+        let rem_part1 = unsafe { self.read_u64_unchecked(offset + 8) };
+
+        // Combine as 128-bit, clear remainder region, set new remainder (branchless)
+        let combined = (rem_part0 as u128) | ((rem_part1 as u128) << 64);
+        let rbits_mask = ((1u128 << self.rbits.get()) - 1) << extra_low;
+        let new_combined = (combined & !rbits_mask) | ((remainder as u128) << extra_low);
+
+        // Split back and write both
+        unsafe {
+            self.write_u64_unchecked(offset, new_combined as u64);
+            self.write_u64_unchecked(offset + 8, (new_combined >> 64) as u64);
         }
-
-        let remaining_bits = end_bit_idx - (start_u64 + 1) * 64;
-        rem_part = u64::from_le_bytes(rem_parts_bytes[8..16].try_into().unwrap());
-        // zero region we'll copy remainder bits in
-        rem_part &= u64::MAX << remaining_bits;
-        rem_part |= remainder >> (self.rbits.usize() - remaining_bits);
-        rem_parts_bytes[8..16].copy_from_slice(&rem_part.to_le_bytes());
     }
 
+    /// Converts an inclusive end index to exclusive, handling wrap-around.
     #[inline]
-    fn get_rem_u64(&self, rem_u64: u64) -> u64 {
-        let rbits = NonZeroU64::from(self.rbits);
-        let bucket_block_idx = (rem_u64 / rbits) % self.total_blocks();
-        let bucket_rem_u64 = (rem_u64 % rbits) as usize;
-        let bucket_rem_start = (bucket_block_idx as usize * self.block_byte_size()) + 1 + 8 + 8;
-        u64::from_le_bytes(
-            self.buffer[bucket_rem_start + bucket_rem_u64 * 8..][..8]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    #[inline]
-    fn set_rem_u64(&mut self, rem_u64: u64, rem: u64) {
-        let rbits = NonZeroU64::from(self.rbits);
-        let bucket_block_idx = (rem_u64 / rbits) % self.total_blocks();
-        let bucket_rem_u64 = (rem_u64 % rbits) as usize;
-        let bucket_rem_start = (bucket_block_idx as usize * self.block_byte_size()) + 1 + 8 + 8;
-        self.buffer[bucket_rem_start + bucket_rem_u64 * 8..][..8]
-            .copy_from_slice(&rem.to_le_bytes());
+    fn wrap_end_exclusive(&self, start: u64, end_inclusive: u64) -> u64 {
+        if end_inclusive < start {
+            end_inclusive + self.total_buckets().get() + 1
+        } else {
+            end_inclusive + 1
+        }
     }
 
     fn shift_remainders_by_1(&mut self, start: u64, end_inc: u64) {
-        let end = if end_inc < start {
-            end_inc + self.total_buckets().get() + 1
-        } else {
-            end_inc + 1
-        };
+        let end = self.wrap_end_exclusive(start, end_inc);
         let mut end_u64 = end * self.rbits.u64() / 64;
         let mut bend = (end * self.rbits.u64() % 64) as usize;
         let start_u64 = start * self.rbits.u64() / 64;
         let bstart = (start * self.rbits.u64() % 64) as usize;
-        while end_u64 != start_u64 {
-            let prev_rem_u64 = self.get_rem_u64(end_u64 - 1);
-            let mut rem_u64 = self.get_rem_u64(end_u64);
-            rem_u64 = prev_rem_u64.shift_right(self.rbits.usize(), &rem_u64, 0, bend);
-            self.set_rem_u64(end_u64, rem_u64);
-            end_u64 -= 1;
-            bend = 64;
+
+        let rbits = self.rbits.get() as usize;
+        let total_blocks = self.total_blocks().get();
+        let block_byte_size = self.block_byte_size();
+
+        // Track position as (block_idx, rem_idx) to avoid division in loop
+        let mut block_idx = (end_u64 / rbits as u64) % total_blocks;
+        let mut rem_idx = (end_u64 % rbits as u64) as usize;
+
+        // Byte offset for a given (block_idx, rem_idx)
+        let offset = |b: u64, r: usize| (b as usize * block_byte_size) + 17 + r * 8;
+
+        // Shift from end to start, caching the previous value
+        if end_u64 != start_u64 {
+            let mut cached_rem = unsafe { self.read_u64_unchecked(offset(block_idx, rem_idx)) };
+
+            while end_u64 != start_u64 {
+                // Compute previous position
+                let (prev_block, prev_rem) = if rem_idx > 0 {
+                    (block_idx, rem_idx - 1)
+                } else {
+                    (
+                        if block_idx > 0 {
+                            block_idx - 1
+                        } else {
+                            total_blocks - 1
+                        },
+                        rbits - 1,
+                    )
+                };
+
+                let prev = unsafe { self.read_u64_unchecked(offset(prev_block, prev_rem)) };
+                let shifted = prev.shift_right(rbits, &cached_rem, 0, bend);
+                unsafe { self.write_u64_unchecked(offset(block_idx, rem_idx), shifted) };
+
+                cached_rem = prev;
+                block_idx = prev_block;
+                rem_idx = prev_rem;
+                end_u64 -= 1;
+                bend = 64;
+            }
         }
-        let mut rem_u64 = self.get_rem_u64(start_u64);
-        rem_u64 = 0u64.shift_right(self.rbits.usize(), &rem_u64, bstart, bend);
-        self.set_rem_u64(start_u64, rem_u64);
+
+        // Handle start position (block_idx/rem_idx already there after loop)
+        let mut rem_val = unsafe { self.read_u64_unchecked(offset(block_idx, rem_idx)) };
+        rem_val = 0u64.shift_right(rbits, &rem_val, bstart, bend);
+        unsafe { self.write_u64_unchecked(offset(block_idx, rem_idx), rem_val) };
     }
 
     fn shift_remainders_back_by_1(&mut self, start: u64, end_inc: u64) {
-        let end = if end_inc < start {
-            end_inc + self.total_buckets().get() + 1
-        } else {
-            end_inc + 1
-        };
+        let end = self.wrap_end_exclusive(start, end_inc);
         let end_u64 = end * self.rbits.u64() / 64;
         let bend = (end * self.rbits.u64() % 64) as usize;
         let mut start_u64 = start * self.rbits.u64() / 64;
         let mut bstart = (start * self.rbits.u64() % 64) as usize;
-        while end_u64 != start_u64 {
-            let next_rem_u64 = self.get_rem_u64(start_u64 + 1);
-            let mut rem_u64 = self.get_rem_u64(start_u64);
-            rem_u64 = next_rem_u64.shift_left(self.rbits.usize(), &rem_u64, bstart, 64);
-            self.set_rem_u64(start_u64, rem_u64);
-            start_u64 += 1;
-            bstart = 0;
+
+        let rbits = self.rbits.get() as usize;
+        let total_blocks = self.total_blocks().get();
+        let block_byte_size = self.block_byte_size();
+
+        // Track position as (block_idx, rem_idx) to avoid division in loop
+        let mut block_idx = (start_u64 / rbits as u64) % total_blocks;
+        let mut rem_idx = (start_u64 % rbits as u64) as usize;
+
+        // Byte offset for a given (block_idx, rem_idx)
+        let offset = |b: u64, r: usize| (b as usize * block_byte_size) + 17 + r * 8;
+
+        // Shift from start to end, caching the previous value
+        if end_u64 != start_u64 {
+            let mut cached_rem = unsafe { self.read_u64_unchecked(offset(block_idx, rem_idx)) };
+
+            while end_u64 != start_u64 {
+                // Compute next position
+                let (next_block, next_rem) = if rem_idx + 1 < rbits {
+                    (block_idx, rem_idx + 1)
+                } else {
+                    ((block_idx + 1) % total_blocks, 0)
+                };
+
+                let next = unsafe { self.read_u64_unchecked(offset(next_block, next_rem)) };
+                let shifted = next.shift_left(rbits, &cached_rem, bstart, 64);
+                unsafe { self.write_u64_unchecked(offset(block_idx, rem_idx), shifted) };
+
+                cached_rem = next;
+                block_idx = next_block;
+                rem_idx = next_rem;
+                start_u64 += 1;
+                bstart = 0;
+            }
         }
-        let mut rem_u64 = self.get_rem_u64(end_u64);
-        rem_u64 = 0u64.shift_left(self.rbits.usize(), &rem_u64, bstart, bend);
-        self.set_rem_u64(end_u64, rem_u64);
+
+        // Handle end position (block_idx/rem_idx already there after loop)
+        let mut rem_val = unsafe { self.read_u64_unchecked(offset(block_idx, rem_idx)) };
+        rem_val = 0u64.shift_left(rbits, &rem_val, bstart, bend);
+        unsafe { self.write_u64_unchecked(offset(block_idx, rem_idx), rem_val) };
     }
 
     fn shift_runends_by_1(&mut self, start: u64, end_inc: u64) {
-        let end = if end_inc < start {
-            end_inc + self.total_buckets().get() + 1
-        } else {
-            end_inc + 1
-        };
+        let end = self.wrap_end_exclusive(start, end_inc);
         let mut end_block = end / 64;
         let mut bend = (end % 64) as usize;
         let start_block = start / 64;
@@ -872,11 +1125,7 @@ impl Filter {
     }
 
     fn shift_runends_back_by_1(&mut self, start: u64, end_inc: u64) {
-        let end = if end_inc < start {
-            end_inc + self.total_buckets().get() + 1
-        } else {
-            end_inc + 1
-        };
+        let end = self.wrap_end_exclusive(start, end_inc);
         let end_block = end / 64;
         let bend = (end % 64) as usize;
         let mut start_block = start / 64;
@@ -914,67 +1163,72 @@ impl Filter {
         (self.run_end(prev_bucket) + 1) % self.total_buckets()
     }
 
-    /// End idx of the end of the run (inclusive).
+    /// End idx of the run for the given bucket (inclusive).
+    /// Inlined when select is small (BMI2), not inlined when select is large (broadword).
+    #[cfg_attr(
+        all(
+            target_arch = "x86_64",
+            any(not(feature = "legacy_x86_64_support"), target_feature = "bmi2")
+        ),
+        inline(always)
+    )]
     fn run_end(&self, hash_bucket_idx: u64) -> u64 {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let bucket_block_idx = hash_bucket_idx / 64;
         let bucket_intrablock_offset = hash_bucket_idx % 64;
-        let bucket_block = self.block(bucket_block_idx);
+        let bucket_block = self.raw_block(bucket_block_idx);
+
+        // Handle offset overflow (255 = needs recalculation)
+        let offset = if bucket_block.offset >= u8::MAX as u64 {
+            self.calc_offset(bucket_block_idx)
+        } else {
+            bucket_block.offset
+        };
         let bucket_intrablock_rank = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
-        // No occupied buckets all the way to bucket_intrablock_offset
-        // which also means hash_bucket_idx isn't occupied
+
+        // No occupied buckets up to this position
         if bucket_intrablock_rank == 0 {
-            return if bucket_block.offset <= bucket_intrablock_offset {
-                // hash_bucket_idx points to an empty bucket unaffected by block offset,
-                // thus end == start
+            return if offset <= bucket_intrablock_offset {
+                // Empty bucket unaffected by spillover, end == start
                 hash_bucket_idx
             } else {
-                // hash_bucket_idx fall within the section occupied by the offset,
-                // thus end == last bucket of offset section
-                (bucket_block_idx * 64 + bucket_block.offset - 1) % self.total_buckets()
+                // Bucket falls within spillover from previous block
+                (bucket_block_idx * 64 + offset - 1) % self.total_buckets()
             };
         }
 
-        // Must search runends to figure out the end of the run
-        let mut runend_block_idx = bucket_block_idx + bucket_block.offset / 64;
-        let mut runend_ignore_bits = bucket_block.offset % 64;
+        // Search for the runend_rank'th runend bit across blocks
+        let mut runend_block_idx = bucket_block_idx + offset / 64;
+        let mut runend_ignore_bits = offset % 64;
         let mut runend_block = self.raw_block(runend_block_idx);
-        // Try to find the runend for the bucket in this block.
-        // We're looking for the runend_rank'th bit set (0 based)
         let mut runend_rank = bucket_intrablock_rank - 1;
-        let mut runend_block_offset = runend_block
-            .runends
-            .select(runend_ignore_bits.., runend_rank);
 
-        if let Some(runend_block_offset) = runend_block_offset {
-            let runend_idx = runend_block_idx * 64 + runend_block_offset;
-            return runend_idx.max(hash_bucket_idx) % self.total_buckets();
-        }
-        // There were not enough runend bits set, keep looking...
         loop {
-            // subtract any runend bits found
+            if let Some(off) = runend_block
+                .runends
+                .select(runend_ignore_bits.., runend_rank)
+            {
+                let runend_idx = runend_block_idx * 64 + off;
+                return runend_idx.max(hash_bucket_idx) % self.total_buckets();
+            }
+            // Not enough runends in this block, continue to next
             runend_rank -= runend_block.runends.popcnt(runend_ignore_bits..);
-            // move to the next block
             runend_block_idx += 1;
             runend_ignore_bits = 0;
             runend_block = self.raw_block(runend_block_idx);
-            runend_block_offset = runend_block
-                .runends
-                .select(runend_ignore_bits.., runend_rank);
-
-            if let Some(runend_block_offset) = runend_block_offset {
-                let runend_idx = runend_block_idx * 64 + runend_block_offset;
-                return runend_idx.max(hash_bucket_idx) % self.total_buckets();
-            }
         }
     }
 
-    /// Returns whether item is present (probabilistically) in the filter.
+    /// Returns `true` if the item is probably in the filter, `false` if definitely not.
+    ///
+    /// May return false positives but never false negatives.
     pub fn contains<T: Hash>(&self, item: T) -> bool {
         self.contains_fingerprint(self.hash(item))
     }
 
-    /// Returns whether the fingerprint is present (probabilistically) in the filter.
+    /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
+    ///
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
     pub fn contains_fingerprint(&self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
@@ -992,13 +1246,17 @@ impl Filter {
         }
     }
 
-    /// Returns the number of times the item appears (probabilistically) in the filter.
-    pub fn count<T: Hash>(&mut self, item: T) -> u64 {
+    /// Returns how many times the item appears in the filter (approximate).
+    ///
+    /// Only meaningful if duplicates were inserted via [`Self::insert_duplicated()`].
+    pub fn count<T: Hash>(&self, item: T) -> u64 {
         self.count_fingerprint(self.hash(item))
     }
 
-    /// Returns the amount of times the fingerprint appears (probabilistically) in the filter.
-    pub fn count_fingerprint(&mut self, hash: u64) -> u64 {
+    /// Returns how many times the fingerprint appears in the filter (approximate).
+    ///
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
+    pub fn count_fingerprint(&self, hash: u64) -> u64 {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return 0;
@@ -1017,29 +1275,59 @@ impl Filter {
         }
     }
 
+    /// Returns true if the slot at hash_bucket_idx is empty (not shifted into by other runs).
     #[inline]
-    fn offset_lower_bound(&self, hash_bucket_idx: u64) -> u64 {
+    fn is_slot_empty(&self, hash_bucket_idx: u64) -> bool {
         let bucket_block_idx = hash_bucket_idx / 64;
         let bucket_intrablock_offset = hash_bucket_idx % 64;
         let bucket_block = self.raw_block(bucket_block_idx);
-        let num_occupied = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
-        if bucket_block.offset <= bucket_intrablock_offset {
-            num_occupied
-                - bucket_block
-                    .runends
-                    .popcnt(bucket_block.offset..bucket_intrablock_offset)
-        } else {
-            bucket_block.offset + num_occupied - bucket_intrablock_offset
+
+        // Spillover run from previous block extends past this position
+        if bucket_block.offset > bucket_intrablock_offset {
+            return false;
         }
+
+        let num_occupied = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
+        let num_runends = bucket_block
+            .runends
+            .popcnt(bucket_block.offset..bucket_intrablock_offset);
+        num_occupied == num_runends
     }
 
+    /// Finds the first empty slot at or after `hash_bucket_idx`.
+    /// Uses offset_lower_bound to skip over occupied slots efficiently.
+    #[inline]
     fn find_first_empty_slot(&self, mut hash_bucket_idx: u64) -> u64 {
+        let mut bucket_intrablock_offset = hash_bucket_idx % 64;
+        let mut bucket_block = self.raw_block(hash_bucket_idx / 64);
+
         loop {
-            let olb = self.offset_lower_bound(hash_bucket_idx);
+            // olb = (runs started at or before here) - (runs ended before here)
+            let num_occupied = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
+            let olb = if bucket_block.offset <= bucket_intrablock_offset {
+                // Normal case: count runends in [offset, position)
+                num_occupied
+                    - bucket_block
+                        .runends
+                        .popcnt(bucket_block.offset..bucket_intrablock_offset)
+            } else {
+                // Spillover run from previous block extends past this position
+                bucket_block.offset + num_occupied - bucket_intrablock_offset
+            };
+
             if olb == 0 {
                 return hash_bucket_idx % self.total_buckets();
             }
+
+            // Advance position by olb slots
             hash_bucket_idx += olb;
+            bucket_intrablock_offset += olb;
+
+            // Handle block boundary crossing
+            if bucket_intrablock_offset >= 64 {
+                bucket_intrablock_offset %= 64;
+                bucket_block = self.raw_block(hash_bucket_idx / 64);
+            }
         }
     }
 
@@ -1053,22 +1341,20 @@ impl Filter {
         }
     }
 
-    /// Removes `item` from the filter.
-    /// Returns whether item was actually found and removed.
+    /// Removes `item` from the filter. Returns `true` if found and removed.
     ///
-    /// Note that removing an item who wasn't previously added to the filter
-    /// may introduce **false negatives**. This is because it could be removing
-    /// fingerprints from a colliding item!
+    /// **Warning:** Removing an item that wasn't inserted may cause false negatives
+    /// for other items with colliding fingerprints.
     pub fn remove<T: Hash>(&mut self, item: T) -> bool {
         self.remove_fingerprint(self.hash(item))
     }
 
-    /// Removes the fingerprint specified by `hash` was from the filter.
-    /// Returns whether a fingerprint was actually found and removed.
+    /// Removes the fingerprint from the filter. Returns `true` if found and removed.
     ///
-    /// Note that removing a fingerprint that wasn't previously added to the filter
-    /// may introduce false negatives. This is because it could be removing
-    /// fingerprints from a colliding hash!
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
+    ///
+    /// **Warning:** Removing a fingerprint that wasn't inserted may cause false negatives
+    /// for other items with colliding fingerprints.
     pub fn remove_fingerprint(&mut self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
@@ -1128,37 +1414,38 @@ impl Filter {
         true
     }
 
-    /// Inserts `item` in the filter, even if already appears to be in the filter.
-    /// This works by inserting a possibly duplicated fingerprint in the filter.
+    /// Inserts `item`, allowing duplicates.
     ///
-    /// This function should be used when the filter is also subject to removals
-    /// and the item is known to not have been added to the filter before (or was removed).
+    /// Use this when the filter supports removals and you're re-adding a previously
+    /// removed item. See also [`Self::insert_counting()`] for bounded duplicates.
     ///
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// # Errors
+    ///
+    /// Returns [`Error::CapacityExceeded`] if the filter is full.
     #[inline]
     pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
         self.insert_counting(u64::MAX, item).map(|_| ())
     }
 
-    /// Inserts `item` in the filter if it's not already present (probabilistically).
-    /// Note that membership is probabilistic, so this function may return false positives
-    /// but never false negatives.
+    /// Inserts `item` if not already present (probabilistically).
     ///
-    /// Returns `Ok(true)` if the item was successfully added to the filter.
-    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter.
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// # Returns
+    ///
+    /// - `Ok(true)` if inserted.
+    /// - `Ok(false)` if already present (may be a false positive).
+    /// - `Err(Error::CapacityExceeded)` if the filter is full.
     #[inline]
     pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
         self.insert_counting(1, item).map(|count| count == 0)
     }
 
-    /// Inserts `item` in the filter, even if already appears to be in the filter.
-    /// This works by inserting a possibly duplicated fingerprint in the filter.
-    /// The argument `max_count` specifies how many duplicates can be inserted.
+    /// Inserts `item` up to `max_count` times.
     ///
-    /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
-    /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// # Returns
+    ///
+    /// - `Ok(prev_count)` where `prev_count` is how many times the item was already present.
+    ///   A new copy is inserted only if `prev_count < max_count`.
+    /// - `Err(Error::CapacityExceeded)` if the filter is full.
     pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error> {
         let hash = self.hash(item);
         match self.insert_impl(max_count, hash) {
@@ -1171,15 +1458,21 @@ impl Filter {
     }
 
     /// Inserts the fingerprint specified by `hash` in the filter.
-    /// `duplicate` specifies if the fingerprint should be added even if it's already in the filter.
     ///
-    /// Note that this function will automatically grow the filter if needed.
-    /// The implementation uses the first [`Self::fingerprint_size`] bits of `hash` to place the fingerprint in the appropriate slot.
-    /// The remaining bits are ignored and will be returned as 0 if the fingerprint is retrieved via [`Self::fingerprints`].
+    /// Use this instead of [`Self::insert()`] when you have pre-computed fingerprints,
+    /// are migrating data between filters, or need deterministic behavior with specific
+    /// hash values. Use [`compute_fingerprint()`] to compute compatible fingerprints.
     ///
-    /// Returns `Ok(true)` if the item was successfully added to the filter.
-    /// Returns `Ok(false)` if the item is already contained (probabilistically) in the filter. Possible if `duplicate` is `false`.
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// # Parameters
+    ///
+    /// - `duplicate`: If `true`, insert even if fingerprint already exists.
+    /// - `hash`: The fingerprint value. Only the lower [`Self::fingerprint_size()`] bits are used.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if inserted successfully.
+    /// - `Ok(false)` if already present and `duplicate` is `false`.
+    /// - `Err(Error::CapacityExceeded)` if the filter is full.
     #[inline]
     pub fn insert_fingerprint(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
         let max_count = if duplicate { u64::MAX } else { 1 };
@@ -1187,16 +1480,15 @@ impl Filter {
             .map(|count| count < max_count)
     }
 
-    /// Inserts the fingerprint specified by `hash` in the filter.
-    /// `max_count` specifies how many occurences of the fingerprint can be added to the filter.
+    /// Inserts the fingerprint up to `max_count` times.
     ///
-    /// Note that this function will automatically grow the filter if needed.
-    /// The implementation uses the first [`Self::fingerprint_size`] bits of `hash` to place the fingerprint in the appropriate slot.
-    /// The remaining bits are ignored and will be returned as 0 if the fingerprint is retrieved via [`Self::fingerprints`].
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
     ///
-    /// Returns `Ok(count)` of how many equal fingerprints _were_ in the filter. So if the item
-    /// was already in the filter `C` times, another insertion was performed if `C < max_count`.
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot admit the new item.
+    /// # Returns
+    ///
+    /// - `Ok(prev_count)` where `prev_count` is how many times the fingerprint was present.
+    ///   A new copy is inserted only if `prev_count < max_count`.
+    /// - `Err(Error::CapacityExceeded)` if the filter is full.
     pub fn insert_fingerprint_counting(&mut self, max_count: u64, hash: u64) -> Result<u64, Error> {
         match self.insert_impl(max_count, hash) {
             Ok(count) => Ok(count),
@@ -1221,7 +1513,7 @@ impl Filter {
         }
 
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
-        if self.offset_lower_bound(hash_bucket_idx) == 0 {
+        if self.is_slot_empty(hash_bucket_idx) {
             if self.len >= self.capacity() {
                 return Err(Error::CapacityExceeded);
             }
@@ -1259,14 +1551,13 @@ impl Filter {
                 runstart_idx += 1;
             }
 
+            insert_idx = runstart_idx % self.total_buckets();
             if runstart_idx > runend_idx {
                 /* new remainder is >= than any remainder in the run. */
                 operation = Operation::NewRunend;
-                insert_idx = runstart_idx % self.total_buckets();
             } else {
                 /* there are larger remainders already in the run. */
                 operation = Operation::BeforeRunend; /* Inserting */
-                insert_idx = runstart_idx % self.total_buckets();
             }
         } else {
             insert_idx = (runend_idx + 1) % self.total_buckets();
@@ -1303,13 +1594,40 @@ impl Filter {
 
     /// Returns an iterator over the fingerprints stored in the filter.
     ///
-    /// Fingerprints will be returned in ascending order.
+    /// Fingerprints are yielded in ascending order. Each value has only the lower
+    /// [`Self::fingerprint_size()`] bits set (upper bits are zero).
+    ///
+    /// This is useful for serialization, migrating data between filters, or
+    /// inspecting stored values. Use [`compute_fingerprint()`] to compute a
+    /// fingerprint compatible with this filter's size.
     pub fn fingerprints(&self) -> FingerprintIter<'_> {
         FingerprintIter::new(self)
     }
 
-    /// Shrinks the capacity of the filter as much as possible while preserving
-    /// the false positive ratios and fingerprint size.
+    /// Shrinks memory usage if occupancy is low enough.
+    ///
+    /// Preserves the fingerprint size and false positive guarantees.
+    /// Shrinking occurs when occupancy drops below 50% of capacity.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let mut filter = qfilter::Filter::new(1000, 0.01).unwrap();
+    /// let initial_memory = filter.memory_usage();
+    ///
+    /// // Fill filter to capacity
+    /// for i in 0..filter.capacity() {
+    ///     filter.insert(i).unwrap();
+    /// }
+    ///
+    /// // Remove most items to reduce occupancy below 50%
+    /// for i in 0..filter.capacity() * 3 / 4 {
+    ///     filter.remove(i);
+    /// }
+    ///
+    /// filter.shrink_to_fit();
+    /// assert!(filter.memory_usage() < initial_memory);
+    /// ```
     pub fn shrink_to_fit(&mut self) {
         if self.total_blocks().get() > 1 && self.len() <= self.capacity() / 2 {
             let mut new = Self::with_qr(
@@ -1327,19 +1645,40 @@ impl Filter {
         }
     }
 
-    /// Merges `other` filter into `self`.
+    /// Merges all fingerprints from `other` into `self`.
     ///
-    /// `keep_duplicates` specifies whether duplicated fingerprints should be store,
-    /// this is normally only useful is the filter is being used for counting.
+    /// # Parameters
     ///
-    /// Note that the `other` filter must have a fingerprint >= `self` fingerprint size,
-    /// otherwise the function will fail with `Err(Error::IncompatibleFingerprintSize)`.
-    /// This is the case for filters created with the same parameters or if the `other`
-    /// filter has a lower target false positive ratio.
+    /// - `keep_duplicates`: If `true`, allows duplicate fingerprints (for counting).
+    /// - `other`: Source filter. Must have `fingerprint_size() >= self.fingerprint_size()`.
     ///
-    /// Returns `Err(Error::CapacityExceeded)` if the filter cannot merge all items.
-    /// Note that in this case items could have already been added and the filter is left
-    /// full but in an otherwise valid state.
+    /// # Errors
+    ///
+    /// - [`Error::IncompatibleFingerprintSize`] if `other` has smaller fingerprints.
+    /// - [`Error::CapacityExceeded`] if `self` becomes full (partial merge may occur).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let mut filter1 = qfilter::Filter::new(100, 0.01).unwrap();
+    /// let mut filter2 = qfilter::Filter::new(100, 0.01).unwrap();
+    ///
+    /// // Insert different items into each filter
+    /// for i in 0..10 {
+    ///     filter1.insert(i).unwrap();
+    /// }
+    /// for i in 10..20 {
+    ///     filter2.insert(i).unwrap();
+    /// }
+    ///
+    /// // Merge filter2 into filter1
+    /// filter1.merge(false, &filter2).unwrap();
+    ///
+    /// // filter1 now contains items from both filters
+    /// for i in 0..20 {
+    ///     assert!(filter1.contains(i));
+    /// }
+    /// ```
     pub fn merge(&mut self, keep_duplicates: bool, other: &Self) -> Result<(), Error> {
         if other.fingerprint_size() < self.fingerprint_size() {
             return Err(Error::IncompatibleFingerprintSize);
@@ -1394,20 +1733,16 @@ impl Filter {
     fn total_blocks(&self) -> NonZeroU64 {
         // The way this is calculated ensures the compilers sees that the result is both != 0 and a power of 2,
         // both of which allow the optimizer to generate much faster division/remainder code.
-        #[cfg(any(debug_assertions, fuzzing))]
-        {
-            NonZeroU64::new((1u64 << self.qbits.get()) / 64).unwrap()
-        }
-        #[cfg(not(any(debug_assertions, fuzzing)))]
-        {
-            // Safety: All filter have at least 1 block (which have 64 slots each)
-            unsafe { NonZeroU64::new_unchecked((1u64 << self.qbits.get()) / 64) }
-        }
+        // Safety: qbits in 6..=63, so (1 << qbits) / 64 is in 1..=2^57
+        unsafe { NonZeroU64::new_unchecked((1u64 << self.qbits.get()) / 64) }
     }
 
     #[inline]
     fn total_buckets(&self) -> NonZeroU64 {
-        NonZeroU64::new(1 << self.qbits.get()).unwrap()
+        // The way this is calculated ensures the compilers sees that the result is both != 0 and a power of 2,
+        // both of which allow the optimizer to generate much faster division/remainder code.
+        // Safety: qbits in 6..=63, so 1 << qbits is in 64..=2^63
+        unsafe { NonZeroU64::new_unchecked(1u64 << self.qbits.get()) }
     }
 
     #[doc(hidden)]
@@ -1461,6 +1796,34 @@ impl std::fmt::Debug for Filter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_fingerprint() {
+        // Same input produces same hash
+        assert_eq!(
+            compute_fingerprint("hello", 64),
+            compute_fingerprint("hello", 64)
+        );
+        // Different inputs produce different hashes
+        assert_ne!(
+            compute_fingerprint("hello", 64),
+            compute_fingerprint("world", 64)
+        );
+        // Truncation works correctly
+        let full = compute_fingerprint("test", 64);
+        assert_eq!(compute_fingerprint("test", 8), full & 0xFF);
+        assert_eq!(compute_fingerprint("test", 16), full & 0xFFFF);
+        assert_eq!(compute_fingerprint("test", 32), full & 0xFFFF_FFFF);
+        // Edge cases
+        assert_eq!(compute_fingerprint("test", 0), 0);
+        assert_eq!(compute_fingerprint("test", 1), full & 1);
+        assert_eq!(compute_fingerprint("test", 65), full); // saturates at 64
+                                                           // Matches filter behavior - confirm via fingerprints() iterator
+        let mut filter = Filter::new(100, 0.01).unwrap();
+        filter.insert("hello").unwrap();
+        let fp = compute_fingerprint("hello", filter.fingerprint_size());
+        assert_eq!(filter.fingerprints().collect::<Vec<_>>(), vec![fp]);
+    }
 
     #[test]
     fn run_end_simple() {
@@ -1787,15 +2150,13 @@ mod tests {
     fn test_with_fingerprint_size_resizes() {
         let mut f = Filter::with_fingerprint_size(0, 8).unwrap();
         assert_eq!(f.fingerprint_size(), 8);
-        assert_eq!(f.capacity_resizeable(), (128u64 * 19).div_ceil(20));
+        assert_eq!(f.max_capacity(), (128u64 * 19).div_ceil(20));
         assert_eq!(f.capacity(), (64u64 * 19).div_ceil(20));
-        for i in 0..f.capacity_resizeable() {
+        for i in 0..f.max_capacity() {
             f.insert_fingerprint(false, i).unwrap();
         }
-        assert_eq!(f.len(), f.capacity_resizeable());
-        assert!(f
-            .insert_fingerprint(false, f.capacity_resizeable())
-            .is_err());
+        assert_eq!(f.len(), f.max_capacity());
+        assert!(f.insert_fingerprint(false, f.max_capacity()).is_err());
     }
 
     #[test]
@@ -1947,7 +2308,7 @@ mod tests {
                     i,
                     filter.capacity()
                 );
-                assert_eq!(filter.capacity(), filter.capacity_resizeable());
+                assert_eq!(filter.capacity(), filter.max_capacity());
             }
         }
     }
@@ -1956,21 +2317,21 @@ mod tests {
     fn test_max_capacity() {
         for i in 7..=64 {
             let f = Filter::with_fingerprint_size(0, i).unwrap();
-            assert!(f.capacity() <= f.capacity_resizeable());
+            assert!(f.capacity() <= f.max_capacity());
             assert_eq!(
-                f.capacity_resizeable(),
+                f.max_capacity(),
                 ((1u64 << (i - 1).min(Filter::MAX_QBITS)) * 19).div_ceil(20)
             );
         }
         for i in 1..Filter::MAX_QBITS {
             let f = Filter::new_resizeable(0, 2u64.pow(i as u32), 0.5).unwrap();
             assert_eq!(f.capacity(), 61);
-            assert!(f.capacity() <= f.capacity_resizeable());
+            assert!(f.capacity() <= f.max_capacity());
         }
         // Test the maximum capacity
         let f = Filter::new_resizeable(0, Filter::MAX_CAPACITY, 0.5).unwrap();
         assert_eq!(f.capacity(), 61);
-        assert_eq!(f.capacity_resizeable(), Filter::MAX_CAPACITY);
+        assert_eq!(f.max_capacity(), Filter::MAX_CAPACITY);
         // Test the maximum capacity + 1, which should fail
         Filter::new_resizeable(0, Filter::MAX_CAPACITY + 1, 0.5).unwrap_err();
     }
