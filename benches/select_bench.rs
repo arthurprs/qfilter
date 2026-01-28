@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -76,25 +76,33 @@ fn bench_select(c: &mut Criterion) {
         ("75%", pattern_75, positions_75),
         ("95%", pattern_95, positions_95),
     ] {
-        group.bench_with_input(BenchmarkId::new("old", name), &(pattern, positions), |b, &(p, pos)| {
-            b.iter(|| {
-                let mut sum = 0u64;
-                for &n in pos {
-                    sum += black_box(select_old(black_box(p), black_box(n))).unwrap_or(0);
-                }
-                sum
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("old", name),
+            &(pattern, positions),
+            |b, &(p, pos)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &n in pos {
+                        sum += black_box(select_old(black_box(p), black_box(n))).unwrap_or(0);
+                    }
+                    sum
+                })
+            },
+        );
 
-        group.bench_with_input(BenchmarkId::new("new", name), &(pattern, positions), |b, &(p, pos)| {
-            b.iter(|| {
-                let mut sum = 0u64;
-                for &n in pos {
-                    sum += black_box(select_new(black_box(p), black_box(n))).unwrap_or(0);
-                }
-                sum
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("new", name),
+            &(pattern, positions),
+            |b, &(p, pos)| {
+                b.iter(|| {
+                    let mut sum = 0u64;
+                    for &n in pos {
+                        sum += black_box(select_new(black_box(p), black_box(n))).unwrap_or(0);
+                    }
+                    sum
+                })
+            },
+        );
     }
 
     group.finish();
