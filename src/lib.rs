@@ -61,7 +61,7 @@
 //!
 //! The `legacy_x86_64_support` feature enables support for older x86_64 CPUs by using
 //! portable fallbacks.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::{
     cmp::Ordering,
