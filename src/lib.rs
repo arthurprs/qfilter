@@ -475,34 +475,27 @@ trait FilterBuf {
     fn rbits(&self) -> NonZeroU8;
     fn max_qbits_opt(&self) -> Option<NonZeroU8>;
 
-    // --- public read-only API (default implementations) ---
-
-    /// Returns the fingerprint size in bits.
     #[inline]
     fn fingerprint_size(&self) -> u8 {
         self.qbits().get() + self.rbits().get()
     }
 
-    /// Returns `true` if the filter contains no items.
     #[inline]
     fn is_empty(&self) -> bool {
         self.filter_len() == 0
     }
 
-    /// Returns the memory usage in bytes.
     #[inline]
     fn memory_usage(&self) -> usize {
         self.buffer().len()
     }
 
-    /// Returns the maximum capacity after all possible growth.
     #[inline]
     fn max_capacity(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
         ((1u64 << self.max_qbits_opt().unwrap_or(self.qbits()).get()) * 19).div_ceil(20)
     }
 
-    /// Returns the current capacity (before next growth).
     #[inline]
     fn capacity(&self) -> u64 {
         if cfg!(fuzzing) {
@@ -517,29 +510,24 @@ trait FilterBuf {
         }
     }
 
-    /// Returns the false positive rate when fully grown.
     fn max_error_ratio_resizeable(&self) -> f64 {
         let extra_rbits = self.max_qbits_opt().unwrap_or(self.qbits()).get() - self.qbits().get();
         2f64.powi(-((self.rbits().get() - extra_rbits) as i32))
     }
 
-    /// Returns the false positive rate at current capacity.
     fn max_error_ratio(&self) -> f64 {
         2f64.powi(-(self.rbits().get() as i32))
     }
 
-    /// Returns the estimated false positive rate at current occupancy.
     fn current_error_ratio(&self) -> f64 {
         let occupancy = self.filter_len() as f64 / self.total_buckets().get() as f64;
         1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits().get() as i32))
     }
 
-    /// Returns `true` if the item is probably in the filter, `false` if definitely not.
-    fn contains_item<T: Hash>(&self, item: T) -> bool {
+    fn contains<T: Hash>(&self, item: T) -> bool {
         self.contains_fingerprint(self.hash_item(item))
     }
 
-    /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
     fn contains_fingerprint(&self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
@@ -557,12 +545,10 @@ trait FilterBuf {
         }
     }
 
-    /// Returns how many times the item appears in the filter (approximate).
-    fn count_item<T: Hash>(&self, item: T) -> u64 {
+    fn count<T: Hash>(&self, item: T) -> u64 {
         self.count_fingerprint(self.hash_item(item))
     }
 
-    /// Returns how many times the fingerprint appears in the filter (approximate).
     fn count_fingerprint(&self, hash: u64) -> u64 {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
@@ -582,15 +568,12 @@ trait FilterBuf {
         }
     }
 
-    // --- private helpers (default implementations) ---
-
     #[inline]
     fn block_byte_size(&self) -> usize {
         1 + 8 + 8 + 64 * self.rbits().usize() / 8
     }
 
-    /// Read u64 from buffer at given offset without bounds checking.
-    /// SAFETY: Caller must ensure offset + 8 <= buffer.len()
+    // SAFETY: Caller must ensure offset + 8 <= buffer.len()
     #[inline(always)]
     unsafe fn read_u64_unchecked(&self, offset: usize) -> u64 {
         debug_assert!(offset + 8 <= self.buffer().len());
@@ -652,7 +635,6 @@ trait FilterBuf {
         remainder
     }
 
-    /// Returns true if the slot at hash_bucket_idx is empty.
     #[inline]
     fn is_slot_empty(&self, hash_bucket_idx: u64) -> bool {
         let bucket_block_idx = hash_bucket_idx / 64;
@@ -670,7 +652,6 @@ trait FilterBuf {
         num_occupied == num_runends
     }
 
-    /// Finds the first empty slot at or after `hash_bucket_idx`.
     #[inline]
     fn find_first_empty_slot(&self, mut hash_bucket_idx: u64) -> u64 {
         let mut bucket_intrablock_offset = hash_bucket_idx % 64;
@@ -722,14 +703,12 @@ trait FilterBuf {
         run_start - block_start
     }
 
-    /// Start idx of the run (inclusive)
     #[inline]
     fn run_start(&self, hash_bucket_idx: u64) -> u64 {
         let prev_bucket = hash_bucket_idx.wrapping_sub(1) % self.total_buckets();
         (self.run_end(prev_bucket) + 1) % self.total_buckets()
     }
 
-    /// End idx of the run for the given bucket (inclusive).
     #[cfg_attr(
         all(
             target_arch = "x86_64",
@@ -968,7 +947,7 @@ impl<'a> FilterRef<'a> {
     ///
     /// May return false positives but never false negatives.
     pub fn contains<T: Hash>(&self, item: T) -> bool {
-        self.contains_item(item)
+        FilterBuf::contains(self, item)
     }
 
     /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
@@ -982,7 +961,7 @@ impl<'a> FilterRef<'a> {
     ///
     /// Only meaningful if duplicates were inserted via [`Filter::insert_duplicated()`].
     pub fn count<T: Hash>(&self, item: T) -> u64 {
-        self.count_item(item)
+        FilterBuf::count(self, item)
     }
 
     /// Returns how many times the fingerprint appears in the filter (approximate).
@@ -1360,7 +1339,7 @@ impl Filter {
     ///
     /// May return false positives but never false negatives.
     pub fn contains<T: Hash>(&self, item: T) -> bool {
-        self.contains_item(item)
+        FilterBuf::contains(self, item)
     }
 
     /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
@@ -1374,7 +1353,7 @@ impl Filter {
     ///
     /// Only meaningful if duplicates were inserted via [`Self::insert_duplicated()`].
     pub fn count<T: Hash>(&self, item: T) -> u64 {
-        self.count_item(item)
+        FilterBuf::count(self, item)
     }
 
     /// Returns how many times the fingerprint appears in the filter (approximate).
@@ -1395,8 +1374,6 @@ impl Filter {
     pub fn fingerprints(&self) -> FingerprintIter<'_> {
         FingerprintIter::new(self)
     }
-
-    // --- mutation-only helpers ---
 
     #[inline]
     fn set_block_runends(&mut self, block_num: u64, runends: u64) {
