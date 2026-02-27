@@ -166,6 +166,24 @@ fn bench_fingerprints(c: &mut Criterion) {
     });
 }
 
+fn bench_sorted_insert(c: &mut Criterion) {
+    let inserter = Builder::new(10000, 0.01).unwrap();
+    let fp_size = inserter.fingerprint_size();
+    let cap = inserter.capacity();
+    let mut fingerprints: Vec<u64> = (0..cap).map(|i| compute_fingerprint(i, fp_size)).collect();
+    fingerprints.sort_unstable();
+
+    c.bench_function("sorted_insert", |b| {
+        b.iter(|| {
+            let mut inserter = Builder::new(10000, 0.01).unwrap();
+            for &h in &fingerprints {
+                inserter.insert_fingerprint(true, h).unwrap();
+            }
+            inserter.into_filter()
+        })
+    });
+}
+
 fn bench_merge(c: &mut Criterion) {
     let mut f1 = Filter::new(10000, 0.01).unwrap();
     let mut f2 = Filter::new(10000, 0.01).unwrap();
@@ -197,6 +215,7 @@ criterion_group!(
     bench_shrink,
     bench_shrink_10pct,
     bench_fingerprints,
+    bench_sorted_insert,
     bench_merge,
 );
 criterion_main!(benches);
