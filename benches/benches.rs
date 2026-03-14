@@ -8,7 +8,7 @@ fn bench_new(c: &mut Criterion) {
 fn bench_get_ok_medium(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
-        f.insert_duplicated(&i).unwrap();
+        f.insert_duplicated(i).unwrap();
     }
     let capacity = f.capacity();
     c.bench_function("get_ok_medium", |b| {
@@ -16,7 +16,7 @@ fn bench_get_ok_medium(c: &mut Criterion) {
         b.iter(|| {
             let mut n = 0;
             for _ in 0..100 {
-                n += f.contains(&i) as u64;
+                n += f.contains(i) as u64;
                 i = (i + 1) % capacity;
             }
             n
@@ -27,14 +27,14 @@ fn bench_get_ok_medium(c: &mut Criterion) {
 fn bench_get_nok_medium(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
-        f.insert_duplicated(&i).unwrap();
+        f.insert_duplicated(i).unwrap();
     }
     c.bench_function("get_nok_medium", |b| {
         let mut i = f.capacity();
         b.iter(|| {
             let mut n = 0;
             for _ in 0..100 {
-                n += f.contains(&i) as u64;
+                n += f.contains(i) as u64;
                 i = i.wrapping_add(1);
             }
             n
@@ -45,7 +45,7 @@ fn bench_get_nok_medium(c: &mut Criterion) {
 fn bench_get_ok_medium_75(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() * 3 / 4 {
-        f.insert_duplicated(&i).unwrap();
+        f.insert_duplicated(i).unwrap();
     }
     let capacity = f.capacity();
     c.bench_function("get_ok_medium_75", |b| {
@@ -53,7 +53,7 @@ fn bench_get_ok_medium_75(c: &mut Criterion) {
         b.iter(|| {
             let mut n = 0;
             for _ in 0..100 {
-                n += f.contains(&i) as u64;
+                n += f.contains(i) as u64;
                 i = (i + 1) % capacity;
             }
             n
@@ -64,14 +64,14 @@ fn bench_get_ok_medium_75(c: &mut Criterion) {
 fn bench_get_nok_medium_75(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() * 3 / 4 {
-        f.insert_duplicated(&i).unwrap();
+        f.insert_duplicated(i).unwrap();
     }
     c.bench_function("get_nok_medium_75", |b| {
         let mut i = f.capacity();
         b.iter(|| {
             let mut n = 0;
             for _ in 0..100 {
-                n += f.contains(&i) as u64;
+                n += f.contains(i) as u64;
                 i = i.wrapping_add(1);
             }
             n
@@ -157,11 +157,29 @@ fn bench_shrink_10pct(c: &mut Criterion) {
 fn bench_fingerprints(c: &mut Criterion) {
     let mut f = Filter::new(100000, 0.01).unwrap();
     for i in 0..f.capacity() {
-        f.insert_duplicated(&i).unwrap();
+        f.insert_duplicated(i).unwrap();
     }
     c.bench_function("fingerprints", |b| {
         b.iter(|| {
             assert_eq!(f.fingerprints().count(), f.capacity() as usize);
+        })
+    });
+}
+
+fn bench_merge(c: &mut Criterion) {
+    let mut f1 = Filter::new(10000, 0.01).unwrap();
+    let mut f2 = Filter::new(10000, 0.01).unwrap();
+    for i in 0..f1.capacity() / 2 {
+        f1.insert_duplicated(i).unwrap();
+    }
+    for i in f1.capacity() / 2..f1.capacity() {
+        f2.insert_duplicated(i).unwrap();
+    }
+    c.bench_function("merge", |b| {
+        b.iter(|| {
+            let mut f = f1.clone();
+            f.merge(false, &f2).unwrap();
+            f
         })
     });
 }
@@ -179,5 +197,6 @@ criterion_group!(
     bench_shrink,
     bench_shrink_10pct,
     bench_fingerprints,
+    bench_merge,
 );
 criterion_main!(benches);
