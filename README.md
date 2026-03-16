@@ -14,6 +14,7 @@ resizing and [serde](https://crates.io/crates/serde) serialization.
 * Supports removals
 * Extremely compact, more so than comparable filters
 * Can be created with a initial small capacity and grow as needed
+* Fast bulk construction from sorted fingerprints via `Builder`
 * (De)Serializable with [serde](https://crates.io/crates/serde)
 * Portable Rust implementation
 * Only verifiable usages of unsafe
