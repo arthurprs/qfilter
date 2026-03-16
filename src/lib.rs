@@ -581,6 +581,207 @@ impl<'a> IntoIterator for &'a Filter {
     }
 }
 
+/// Builder for constructing a [`Filter`] from fingerprints in sorted (ascending) order.
+///
+/// This is significantly faster than repeated [`Filter::insert_fingerprint()`] calls
+/// when fingerprints are known to be in non-decreasing order, as it avoids run boundary
+/// lookups, linear scans, and element shifting — reducing each insertion to a simple
+/// sequential write.
+///
+/// The builder creates the filter internally and returns it via [`Self::into_filter()`]
+/// when done.
+///
+/// # Example
+///
+/// ```rust
+/// let mut inserter = qfilter::Builder::new(1000, 0.01).unwrap();
+/// let fp_size = inserter.fingerprint_size();
+/// let mut sorted_hashes: Vec<u64> = (0..100u64)
+///     .map(|i| qfilter::compute_fingerprint(i, fp_size))
+///     .collect();
+/// sorted_hashes.sort();
+///
+/// for hash in sorted_hashes {
+///     inserter.insert_fingerprint(false, hash).unwrap();
+/// }
+/// let filter = inserter.into_filter();
+///
+/// for i in 0..100u64 {
+///     assert!(filter.contains(i));
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Builder {
+    filter: Filter,
+    next_slot: u64,
+    last_quotient: u64,
+    last_remainder: u64,
+}
+
+impl Builder {
+    /// Wraps an empty filter into a builder with zeroed tracking state.
+    fn new_empty(filter: Filter) -> Self {
+        debug_assert!(filter.is_empty());
+        Self {
+            filter,
+            next_slot: 0,
+            last_quotient: 0,
+            last_remainder: 0,
+        }
+    }
+
+    /// Creates a new builder with the given capacity and false positive rate.
+    ///
+    /// See [`Filter::new()`] for parameter details.
+    pub fn new(capacity: u64, fp_rate: f64) -> Result<Self, Error> {
+        Filter::new(capacity, fp_rate).map(Self::new_empty)
+    }
+
+    /// Creates a resizeable builder that can grow from `initial_capacity`
+    /// to `max_capacity`.
+    ///
+    /// See [`Filter::new_resizeable()`] for parameter details.
+    pub fn new_resizeable(
+        initial_capacity: u64,
+        max_capacity: u64,
+        fp_rate: f64,
+    ) -> Result<Self, Error> {
+        Filter::new_resizeable(initial_capacity, max_capacity, fp_rate).map(Self::new_empty)
+    }
+
+    /// Creates a builder with a specific fingerprint bit size.
+    ///
+    /// Use this when storing pre-computed fingerprints via [`Self::insert_fingerprint()`].
+    ///
+    /// See [`Filter::with_fingerprint_size()`] for parameter details.
+    pub fn with_fingerprint_size(
+        initial_capacity: u64,
+        fingerprint_bits: u8,
+    ) -> Result<Self, Error> {
+        Filter::with_fingerprint_size(initial_capacity, fingerprint_bits).map(Self::new_empty)
+    }
+
+    /// Creates a builder for internal rebuild paths (grow, shrink).
+    fn with_qr(
+        qbits: NonZeroU8,
+        rbits: NonZeroU8,
+        max_qbits: Option<NonZeroU8>,
+    ) -> Result<Self, Error> {
+        let mut filter = Filter::with_qr(qbits, rbits)?;
+        filter.max_qbits = max_qbits;
+        Ok(Self::new_empty(filter))
+    }
+
+    /// Returns the fingerprint size (in bits) of the filter being built.
+    pub fn fingerprint_size(&self) -> u8 {
+        self.filter.fingerprint_size()
+    }
+
+    /// Returns the current capacity of the filter being built.
+    pub fn capacity(&self) -> u64 {
+        self.filter.capacity()
+    }
+
+    /// Consumes the builder and returns the constructed filter.
+    pub fn into_filter(self) -> Filter {
+        self.filter
+    }
+
+    /// Inserts a fingerprint that must be >= all previously inserted fingerprints.
+    ///
+    /// # Parameters
+    ///
+    /// - `duplicate`: If `true`, insert even if the fingerprint equals the previous one.
+    ///   If `false`, skip duplicates (return `Ok(false)`).
+    /// - `hash`: The fingerprint value. Only the lower
+    ///   [`Filter::fingerprint_size()`] bits are used.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` if inserted successfully.
+    /// - `Ok(false)` if already present and `duplicate` is `false`.
+    /// - `Err(Error::CapacityExceeded)` if the filter is full and cannot grow.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hash` is not in non-decreasing order relative to the
+    /// previously inserted fingerprint.
+    #[inline] // see insert_impl
+    pub fn insert_fingerprint(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
+        match self.insert_impl(duplicate, hash) {
+            Ok(inserted) => Ok(inserted),
+            Err(Error::CapacityExceeded) => {
+                *self = self.filter.rebuild_grown()?;
+                self.insert_impl(duplicate, hash)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Core sorted insertion. Returns `Ok(true)` if a new element was inserted,
+    /// `Ok(false)` if it was a duplicate and `duplicate` is `false`.
+    // This is optimized enough that the function call overhead is noticeable,
+    // so we force inline it into the caller (insert_fingerprint) always.
+    // For instance, this makes merge about 25% faster.
+    #[inline(always)]
+    fn insert_impl(&mut self, duplicate: bool, hash: u64) -> Result<bool, Error> {
+        let (quotient, remainder) = self.filter.calc_qr(hash);
+
+        if !self.filter.is_empty() {
+            assert!(
+                quotient > self.last_quotient
+                    || (quotient == self.last_quotient && remainder >= self.last_remainder),
+                "fingerprints must be in non-decreasing order: ({quotient}, {remainder}) < ({}, {})",
+                self.last_quotient,
+                self.last_remainder
+            );
+
+            // Duplicate detection — since input is sorted, duplicates are consecutive.
+            if quotient == self.last_quotient && remainder == self.last_remainder && !duplicate {
+                return Ok(false);
+            }
+
+            if self.filter.len >= self.filter.capacity() {
+                return Err(Error::CapacityExceeded);
+            }
+
+            // When next_slot wraps past total_buckets, the simple sequential-append
+            // assumption breaks down — fall back to the general insertion path.
+            if self.next_slot >= self.filter.total_buckets().get() {
+                self.last_quotient = quotient;
+                self.last_remainder = remainder;
+                let max_count = if duplicate { u64::MAX } else { 1 };
+                let count = self.filter.insert_impl(max_count, hash)?;
+                return Ok(count < max_count);
+            }
+        }
+
+        // Place the element at the appropriate slot.
+        let slot = if quotient >= self.next_slot {
+            // Canonical slot is free — start a new run here.
+            self.filter.set_occupied(quotient, true);
+            quotient
+        } else {
+            if quotient == self.last_quotient {
+                // Extending current run: clear previous runend.
+                self.filter.set_runend(self.next_slot - 1, false);
+            } else {
+                // New quotient, but spilled past canonical slot.
+                self.filter.set_occupied(quotient, true);
+            }
+            self.filter.inc_offsets(quotient, self.next_slot);
+            self.next_slot
+        };
+        self.filter.set_runend(slot, true);
+        self.filter.set_remainder(slot, remainder);
+        self.next_slot = slot + 1;
+        self.last_quotient = quotient;
+        self.last_remainder = remainder;
+        self.filter.len += 1;
+        Ok(true)
+    }
+}
+
 impl Filter {
     /// Maximum log2 number of slots that can be used in the filter.
     /// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
@@ -1630,14 +1831,19 @@ impl Filter {
     /// ```
     pub fn shrink_to_fit(&mut self) {
         if self.total_blocks().get() > 1 && self.len() <= self.capacity() / 2 {
-            let mut new = Self::with_qr(
+            let mut inserter = Builder::with_qr(
                 (self.qbits.get() - 1).try_into().unwrap(),
                 (self.rbits.get() + 1).try_into().unwrap(),
+                self.max_qbits,
             )
             .unwrap();
-            new.max_qbits = self.max_qbits;
-            new.fill_from_sorted(true, self.fingerprints())
-                .expect("shrunk filter has capacity for existing items");
+            // Use insert_impl directly: the shrunk filter has capacity >= len (50% occupancy).
+            for hash in self.fingerprints() {
+                inserter
+                    .insert_impl(true, hash)
+                    .expect("Shrinking should not fail");
+            }
+            let new = inserter.into_filter();
             debug_assert_eq!(new.len, self.len);
             debug_assert_eq!(new.fingerprint_size(), self.fingerprint_size());
             *self = new;
@@ -1648,7 +1854,10 @@ impl Filter {
     ///
     /// # Parameters
     ///
-    /// - `keep_duplicates`: If `true`, allows duplicate fingerprints (for counting).
+    /// - `keep_duplicates`: If `true`, the result is a multiset sum — each fingerprint
+    ///   appears `count_self + count_other` times. If `false`, the result is a set union —
+    ///   each unique fingerprint appears exactly once, discarding any duplicates that
+    ///   existed in either filter.
     /// - `other`: Source filter. Must have `fingerprint_size() >= self.fingerprint_size()`.
     ///
     /// # Errors
@@ -1680,18 +1889,17 @@ impl Filter {
     /// }
     /// ```
     pub fn merge(&mut self, keep_duplicates: bool, other: &Self) -> Result<(), Error> {
-        if other.fingerprint_size() < self.fingerprint_size() {
-            return Err(Error::IncompatibleFingerprintSize);
-        }
         if self.fingerprint_size() == other.fingerprint_size() {
             *self = self.merge_sorted(keep_duplicates, other)?;
-        } else {
+        } else if other.fingerprint_size() >= self.fingerprint_size() {
             // Different fingerprint sizes: truncation changes sort order,
             // so fall back to one-by-one insertion.
             let max_count = if keep_duplicates { u64::MAX } else { 1 };
             for hash in other.fingerprints() {
                 self.insert_impl(max_count, hash)?;
             }
+        } else {
+            return Err(Error::IncompatibleFingerprintSize);
         }
         Ok(())
     }
@@ -1702,154 +1910,74 @@ impl Filter {
     /// the filters have identical fingerprint sizes (same qbits/rbits split).
     fn merge_sorted(&self, keep_duplicates: bool, other: &Self) -> Result<Filter, Error> {
         debug_assert_eq!(self.fingerprint_size(), other.fingerprint_size());
-        // Create filter without max_qbits: merge should not implicitly grow.
-        let mut result = Self::with_qr(self.qbits, self.rbits)?;
+        // Preserve growth headroom from self.
+        // Pre-size to avoid intermediate growths, capped by self's max_qbits.
+        let needed = if keep_duplicates {
+            self.len.saturating_add(other.len)
+        } else {
+            // This may underestimate if there are no duplicates,
+            // but it's a safe upper bound and avoids overallocation.
+            self.len.max(other.len)
+        };
+        let needed_qbits = calculate_needed_slots(needed)
+            .map_err(|_| Error::CapacityExceeded)?
+            .trailing_zeros() as u8;
+        let max_qbits_allowed = self.max_qbits.map_or(self.qbits.get(), |m| m.get());
+        if needed_qbits > max_qbits_allowed {
+            return Err(Error::CapacityExceeded);
+        }
+        let qbits = self.qbits.get().max(needed_qbits);
+        let rbits = self.fingerprint_size() - qbits;
+        let mut builder = Builder::with_qr(
+            NonZeroU8::new(qbits).unwrap(),
+            NonZeroU8::new(rbits).unwrap(),
+            self.max_qbits,
+        )?;
         let mut a = self.fingerprints().peekable();
         let mut b = other.fingerprints().peekable();
-        let merged = std::iter::from_fn(|| match (a.peek(), b.peek()) {
-            (Some(&a_val), Some(&b_val)) if a_val <= b_val => {
-                a.next();
-                Some(a_val)
-            }
-            (Some(_), Some(_)) => b.next(),
-            (Some(_), None) => a.next(),
-            (None, Some(_)) => b.next(),
-            (None, None) => None,
-        });
-        result.fill_from_sorted(keep_duplicates, merged)?;
-        Ok(result)
+        loop {
+            let hash = match (a.peek(), b.peek()) {
+                (Some(&a_val), Some(&b_val)) if a_val <= b_val => {
+                    a.next();
+                    a_val
+                }
+                (Some(_), Some(_)) => b.next().unwrap(),
+                (Some(_), None) => a.next().unwrap(),
+                (None, Some(_)) => b.next().unwrap(),
+                (None, None) => break,
+            };
+            builder.insert_fingerprint(keep_duplicates, hash)?;
+        }
+        Ok(builder.into_filter())
     }
 
     #[inline]
     fn grow_if_possible(&mut self) -> Result<(), Error> {
-        if let Some(m) = self.max_qbits {
-            if m > self.qbits {
-                self.grow();
-                return Ok(());
-            }
-        }
-        Err(Error::CapacityExceeded)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow(&mut self) {
-        let qbits = self.qbits.checked_add(1).unwrap();
-        let rbits = NonZeroU8::new(self.rbits.get() - 1).unwrap();
-        let mut grown = Self::with_qr(qbits, rbits).unwrap();
-        grown.max_qbits = self.max_qbits;
-        grown
-            .fill_from_sorted(true, self.fingerprints())
-            .expect("grown filter has capacity for existing items");
-        assert_eq!(self.len, grown.len);
-        *self = grown;
-    }
-
-    /// Fills an empty filter from a sorted (non-decreasing) iterator of fingerprints.
-    ///
-    /// This is significantly faster than repeated [`Self::insert_fingerprint()`] calls
-    /// because it avoids run boundary lookups, linear scans, and element shifting —
-    /// reducing each insertion to a simple sequential write.
-    ///
-    /// Used internally by [`Self::grow`], [`Self::shrink_to_fit`], and
-    /// [`Self::merge`] to rebuild filters in O(n) time.
-    ///
-    /// # Panics
-    ///
-    /// Panics if fingerprints are not in non-decreasing order.
-    fn fill_from_sorted(
-        &mut self,
-        duplicate: bool,
-        fingerprints: impl Iterator<Item = u64>,
-    ) -> Result<(), Error> {
-        debug_assert!(self.is_empty());
-        let mut next_slot: u64 = 0;
-        let mut last_quotient: u64 = 0;
-        let mut last_remainder: u64 = 0;
-        let mut has_previous = false;
-
-        for hash in fingerprints {
-            let (quotient, remainder) = self.calc_qr(hash);
-
-            assert!(
-                !has_previous
-                    || quotient > last_quotient
-                    || (quotient == last_quotient && remainder >= last_remainder),
-                "fingerprints must be in non-decreasing order: \
-                 ({quotient}, {remainder}) < ({last_quotient}, {last_remainder})"
-            );
-
-            if !has_previous {
-                if self.len >= self.capacity() {
-                    return Err(Error::CapacityExceeded);
-                }
-                self.set_occupied(quotient, true);
-                self.set_runend(quotient, true);
-                self.set_remainder(quotient, remainder);
-                next_slot = quotient + 1;
-                last_quotient = quotient;
-                last_remainder = remainder;
-                has_previous = true;
-                self.len += 1;
-                continue;
-            }
-
-            let total_buckets = self.total_buckets().get();
-
-            // When next_slot wraps past total_buckets, the simple sequential-append
-            // assumption breaks down: the target physical slot may be occupied.
-            // Delegate to insert_impl which handles the general case.
-            if next_slot >= total_buckets {
-                let max_count = if duplicate { u64::MAX } else { 1 };
-                let count = self.insert_impl(max_count, hash)?;
-                last_remainder = remainder;
-                last_quotient = quotient;
-                if count >= max_count {
-                    continue;
-                }
-                continue;
-            }
-
-            // Handle duplicates — since input is sorted, duplicates are consecutive.
-            if quotient == last_quotient && remainder == last_remainder && !duplicate {
-                continue;
-            }
-
-            if self.len >= self.capacity() {
-                return Err(Error::CapacityExceeded);
-            }
-
-            if quotient == last_quotient {
-                // Extending the current run: append at next_slot.
-                let prev_runend = next_slot - 1;
-                self.set_runend(prev_runend, false);
-                self.set_runend(next_slot, true);
-                self.set_remainder(next_slot, remainder);
-                self.inc_offsets(last_quotient, next_slot);
-                next_slot += 1;
-            } else {
-                // New quotient (quotient > last_quotient)
-                debug_assert!(quotient > last_quotient);
-                self.set_occupied(quotient, true);
-
-                if quotient >= next_slot {
-                    self.set_runend(quotient, true);
-                    self.set_remainder(quotient, remainder);
-                    next_slot = quotient + 1;
-                } else {
-                    self.set_runend(next_slot, true);
-                    self.set_remainder(next_slot, remainder);
-                    self.inc_offsets(quotient, next_slot);
-                    next_slot += 1;
-                }
-
-                last_quotient = quotient;
-            }
-
-            last_remainder = remainder;
-            self.len += 1;
-        }
+        *self = self.rebuild_grown()?.into_filter();
         Ok(())
+    }
+
+    /// Rebuilds this filter into a grown [`Builder`] with `qbits + 1`.
+    ///
+    /// Returns a builder (not a filter) so that callers can either continue
+    /// the fast sequential-append path or consume it via [`Builder::into_filter()`].
+    #[cold]
+    fn rebuild_grown(&self) -> Result<Builder, Error> {
+        let max = self.max_qbits.ok_or(Error::CapacityExceeded)?;
+        if max <= self.qbits {
+            return Err(Error::CapacityExceeded);
+        }
+        let qbits = self.qbits.checked_add(1).ok_or(Error::CapacityExceeded)?;
+        let rbits = NonZeroU8::new(self.rbits.get() - 1).ok_or(Error::CapacityExceeded)?;
+        let mut inserter = Builder::with_qr(qbits, rbits, self.max_qbits)?;
+        // Use insert_impl directly: the new filter has 2x capacity so growth cannot happen.
+        for hash in self.fingerprints() {
+            inserter
+                .insert_impl(true, hash)
+                .expect("Growth should not fail");
+        }
+        debug_assert_eq!(self.len, inserter.filter.len);
+        Ok(inserter)
     }
 
     #[inline]
@@ -2107,9 +2235,9 @@ mod tests {
         for _ in 0..3 {
             f.insert_duplicated(1).unwrap();
         }
-        f.grow();
-        f.grow();
-        f.grow();
+        f.grow_if_possible().unwrap();
+        f.grow_if_possible().unwrap();
+        f.grow_if_possible().unwrap();
         assert_eq!(f.count(0), 50);
         assert_eq!(f.count(1), 3);
     }
@@ -2365,10 +2493,18 @@ mod tests {
                 f1.insert_impl(u64::MAX, 1),
                 Err(Error::CapacityExceeded)
             ));
-            assert!(matches!(
-                f1.merge(true, &f1.clone()),
-                Err(Error::CapacityExceeded)
-            ));
+            if f1.max_capacity() > f1.capacity() {
+                // Resizable: merge grows to accommodate.
+                let len_before = f1.len();
+                f1.merge(true, &f1.clone()).unwrap();
+                assert_eq!(f1.len(), len_before * 2);
+            } else {
+                // Non-resizable: merge fails when capacity exceeded.
+                assert!(matches!(
+                    f1.merge(true, &f1.clone()),
+                    Err(Error::CapacityExceeded)
+                ));
+            }
             assert!(matches!(f1.insert_fingerprint(false, 1), Ok(false)));
             assert!(matches!(f1.merge(false, &f1.clone()), Ok(())));
         }
@@ -2382,6 +2518,68 @@ mod tests {
             Filter::new(1, 0.001).unwrap(),
             Filter::new(1, 0.0001).unwrap(),
         );
+    }
+
+    #[test]
+    fn test_merge_correctness() {
+        let max_cap = 10000u64;
+        for (cap, fp_rate) in [(100, 0.01), (500, 0.001), (1000, 0.01)] {
+            let new = |c: u64| Filter::new_resizeable(c, max_cap, fp_rate).unwrap();
+            let n = cap as u64;
+
+            // Build two filters with 50% overlap:
+            // f1 has [0..n), f2 has [n/2..n*3/2)
+            let mut f1 = new(n);
+            let mut f2 = new(n);
+            for i in 0..n {
+                f1.insert_duplicated(i).unwrap();
+            }
+            for i in n / 2..n + n / 2 {
+                f2.insert_duplicated(i).unwrap();
+            }
+
+            // Dedup merge: result should contain all unique items
+            let mut merged_dedup = f1.clone();
+            merged_dedup.merge(false, &f2).unwrap();
+            for i in 0..n + n / 2 {
+                assert!(merged_dedup.contains(i), "missing {i} after dedup merge");
+            }
+
+            // Self-merge with dedup shouldn't change len
+            let mut self_merge = f1.clone();
+            self_merge.merge(false, &f1).unwrap();
+            assert_eq!(self_merge.len(), f1.len());
+
+            // Duplicate merge: len should be sum of both
+            let mut merged_dup = f1.clone();
+            merged_dup.merge(true, &f2).unwrap();
+            assert_eq!(merged_dup.len(), f1.len() + f2.len());
+            for i in 0..n + n / 2 {
+                assert!(merged_dup.contains(i), "missing {i} after dup merge");
+            }
+
+            // Merge two disjoint full filters (exercises pre-sizing growth)
+            let mut r1 = new(n);
+            let mut r2 = new(n);
+            for i in 0..n {
+                r1.insert_duplicated(i).unwrap();
+            }
+            for i in n..n * 2 {
+                r2.insert_duplicated(i).unwrap();
+            }
+            let r1_len = r1.len();
+            let r2_len = r2.len();
+            r1.merge(true, &r2).unwrap();
+            assert_eq!(r1.len(), r1_len + r2_len);
+
+            // Fingerprints must remain sorted after every merge
+            for f in [&merged_dedup, &self_merge, &merged_dup, &r1] {
+                let fps: Vec<u64> = f.fingerprints().collect();
+                for w in fps.windows(2) {
+                    assert!(w[0] <= w[1], "unsorted fingerprints: {} > {}", w[0], w[1]);
+                }
+            }
+        }
     }
 
     #[cfg(feature = "serde")]
@@ -2474,25 +2672,200 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_from_sorted_identical_state() {
-        // Verifies that fill_from_sorted produces byte-identical filter state
-        // compared to regular insertion, across various sizes and fp rates,
-        // including at high occupancy where the wrapping slow path is triggered.
-        for (cap, fp_rate) in [(50, 0.01), (100, 0.01), (500, 0.001), (1000, 0.0001)] {
-            let mut regular = Filter::new(cap, fp_rate).unwrap();
-            let mut sorted = regular.clone();
+    fn test_builder_matches_regular() {
+        for fp_rate in [0.01, 0.001, 0.0001] {
+            for cap in [100, 500, 1000, 5000] {
+                let mut regular = Filter::new(cap, fp_rate).unwrap();
+                let mut fingerprints: Vec<u64> = (0..regular.capacity())
+                    .map(|i| compute_fingerprint(i, regular.fingerprint_size()))
+                    .collect();
+                fingerprints.sort_unstable();
 
-            let mut fingerprints: Vec<u64> = (0..regular.capacity())
-                .map(|i| compute_fingerprint(i, regular.fingerprint_size()))
+                for &h in &fingerprints {
+                    regular.insert_fingerprint(true, h).unwrap();
+                }
+
+                let mut inserter = Builder::new(cap, fp_rate).unwrap();
+                for &h in &fingerprints {
+                    inserter.insert_fingerprint(true, h).unwrap();
+                }
+                let sorted = inserter.into_filter();
+
+                assert_eq!(regular.len(), sorted.len());
+                let reg_fps: Vec<u64> = regular.fingerprints().collect();
+                let sort_fps: Vec<u64> = sorted.fingerprints().collect();
+                assert_eq!(reg_fps, sort_fps);
+            }
+        }
+    }
+
+    #[test]
+    fn test_builder_no_duplicates() {
+        let mut inserter = Builder::new(1000, 0.01).unwrap();
+        let fp_size = inserter.fingerprint_size();
+        let mut fingerprints: Vec<u64> = (0..500u64)
+            .map(|i| compute_fingerprint(i, fp_size))
+            .collect();
+        fingerprints.sort_unstable();
+        let mut inserted = 0;
+        for &h in &fingerprints {
+            if inserter.insert_fingerprint(false, h).unwrap() {
+                inserted += 1;
+            }
+        }
+        let f = inserter.into_filter();
+
+        // With duplicate=false, count of inserts should equal the number of distinct fingerprints
+        let distinct: std::collections::HashSet<u64> = fingerprints.iter().copied().collect();
+        assert_eq!(inserted, distinct.len());
+        assert_eq!(f.len(), distinct.len() as u64);
+    }
+
+    #[test]
+    fn test_builder_with_duplicates() {
+        let mut inserter = Builder::new(1000, 0.01).unwrap();
+        let fp_size = inserter.fingerprint_size();
+
+        // Insert the same fingerprint multiple times
+        let hash = compute_fingerprint(42u64, fp_size);
+        for _ in 0..10 {
+            inserter.insert_fingerprint(true, hash).unwrap();
+        }
+        let f = inserter.into_filter();
+
+        assert_eq!(f.len(), 10);
+        assert_eq!(f.count_fingerprint(hash), 10);
+    }
+
+    #[test]
+    fn test_builder_auto_growth() {
+        let mut inserter = Builder::new_resizeable(100, 5000, 0.01).unwrap();
+        let initial_cap = inserter.capacity();
+        let fp_size = inserter.fingerprint_size();
+
+        let mut fingerprints: Vec<u64> = (0..3000u64)
+            .map(|i| compute_fingerprint(i, fp_size))
+            .collect();
+        fingerprints.sort_unstable();
+        for &h in &fingerprints {
+            inserter.insert_fingerprint(true, h).unwrap();
+        }
+        let f = inserter.into_filter();
+
+        assert!(f.capacity() > initial_cap, "filter should have grown");
+        assert_eq!(f.len(), 3000);
+
+        // Verify all items are present
+        for i in 0..3000u64 {
+            assert!(f.contains(i), "missing item {}", i);
+        }
+    }
+
+    #[test]
+    fn test_builder_empty_filter() {
+        let inserter = Builder::new(100, 0.01).unwrap();
+        let f = inserter.into_filter();
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn test_builder_various_fingerprint_sizes() {
+        for fp_size in [14, 16, 20, 24, 32] {
+            let mut inserter = Builder::with_fingerprint_size(500, fp_size).unwrap();
+            let cap = inserter.capacity();
+            let mut fingerprints: Vec<u64> =
+                (0..cap).map(|i| compute_fingerprint(i, fp_size)).collect();
+            fingerprints.sort_unstable();
+            for &h in &fingerprints {
+                inserter.insert_fingerprint(true, h).unwrap();
+            }
+            let f = inserter.into_filter();
+
+            assert_eq!(f.len(), cap);
+
+            // Verify via fingerprints() iteration
+            let stored: Vec<u64> = f.fingerprints().collect();
+            assert_eq!(stored.len(), cap as usize);
+            // Should be sorted
+            for w in stored.windows(2) {
+                assert!(w[0] <= w[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_builder_single_block() {
+        // Small filter that fits in a single block (64 slots)
+        let mut inserter = Builder::new(50, 0.01).unwrap();
+        let fp_size = inserter.fingerprint_size();
+        let cap = inserter.capacity();
+        let mut fingerprints: Vec<u64> =
+            (0..cap).map(|i| compute_fingerprint(i, fp_size)).collect();
+        fingerprints.sort_unstable();
+        for &h in &fingerprints {
+            inserter.insert_fingerprint(true, h).unwrap();
+        }
+        let f = inserter.into_filter();
+
+        assert_eq!(f.total_buckets().get(), 64);
+        assert_eq!(f.len(), cap);
+        for i in 0..cap {
+            assert!(f.contains(i));
+        }
+    }
+
+    #[test]
+    fn test_builder_multi_block_spillover() {
+        // Use a filter with multiple blocks and a small fingerprint size to force spillover
+        let mut inserter = Builder::with_fingerprint_size(500, 14).unwrap();
+        let cap = inserter.capacity();
+        let fp_size = inserter.fingerprint_size();
+        let mask = (1u64 << fp_size) - 1;
+
+        // Create fingerprints that will have many collisions in the same quotient
+        // to force runs that spill across block boundaries
+        let mut fingerprints: Vec<u64> = (0..cap).map(|i| i & mask).collect();
+        fingerprints.sort_unstable();
+
+        let mut regular = Filter::with_fingerprint_size(500, 14).unwrap();
+        for &h in &fingerprints {
+            regular.insert_fingerprint(true, h).unwrap();
+        }
+        for &h in &fingerprints {
+            inserter.insert_fingerprint(true, h).unwrap();
+        }
+        let sorted = inserter.into_filter();
+
+        assert_eq!(sorted.len(), regular.len());
+        assert_eq!(
+            sorted.fingerprints().collect::<Vec<_>>(),
+            regular.fingerprints().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_builder_identical_state() {
+        // Verifies that sorted insertion produces byte-identical filter state
+        // compared to regular insertion, including at high occupancy where
+        // the wrapping slow path is triggered.
+        for (cap, fp_rate) in [(500, 0.001), (100, 0.01), (1000, 0.0001)] {
+            let mut inserter = Builder::new(cap, fp_rate).unwrap();
+            let fp_size = inserter.fingerprint_size();
+            let capacity = inserter.capacity();
+
+            let mut fingerprints: Vec<u64> = (0..capacity)
+                .map(|i| compute_fingerprint(i, fp_size))
                 .collect();
             fingerprints.sort_unstable();
 
+            let mut regular = Filter::new(cap, fp_rate).unwrap();
             for &h in &fingerprints {
                 regular.insert_fingerprint(true, h).unwrap();
             }
-            sorted
-                .fill_from_sorted(true, fingerprints.iter().copied())
-                .unwrap();
+            for &h in &fingerprints {
+                inserter.insert_fingerprint(true, h).unwrap();
+            }
+            let sorted = inserter.into_filter();
 
             assert_eq!(
                 regular.buffer, sorted.buffer,
@@ -2502,58 +2875,32 @@ mod tests {
     }
 
     #[test]
-    fn test_fill_from_sorted_dedup() {
-        let mut filter = Filter::new(1000, 0.01).unwrap();
-        let fp_size = filter.fingerprint_size();
-
-        let mut fingerprints: Vec<u64> = (0..500u64)
-            .map(|i| compute_fingerprint(i, fp_size))
-            .collect();
-        fingerprints.sort_unstable();
-
-        filter
-            .fill_from_sorted(false, fingerprints.iter().copied())
-            .unwrap();
-
-        let distinct: std::collections::HashSet<u64> = fingerprints.iter().copied().collect();
-        assert_eq!(filter.len(), distinct.len() as u64);
-    }
-
-    #[test]
-    fn test_fill_from_sorted_duplicates() {
-        let mut filter = Filter::new(1000, 0.01).unwrap();
-        let fp_size = filter.fingerprint_size();
-        let hash = compute_fingerprint(42u64, fp_size);
-
-        filter
-            .fill_from_sorted(true, std::iter::repeat(hash).take(10))
-            .unwrap();
-
-        assert_eq!(filter.len(), 10);
-        assert_eq!(filter.count_fingerprint(hash), 10);
-    }
-
-    #[test]
-    fn test_fill_from_sorted_hash_collision_dedup() {
-        // Regression: different hash values that truncate to the same
+    fn test_builder_hash_collision_dedup() {
+        // Regression test: two different hash values that truncate to the same
         // (quotient, remainder) must be treated as duplicates when duplicate=false.
-        let mut regular = Filter::with_fingerprint_size(5, 7).unwrap();
-        let mut sorted = regular.clone();
+        // See: fuzz_sorted_insert/minimized-from-c401dba0cd67a0a3c34c19ce181d23a0dbd37e8e
+        let fp_size = 7u8;
+        let cap = 5u64;
 
         let mut fingerprints: Vec<u64> = vec![0, 12032];
         fingerprints.sort_unstable();
 
+        // Regular insertion
+        let mut regular = Filter::with_fingerprint_size(cap, fp_size).unwrap();
         for &h in &fingerprints {
             let _ = regular.insert_fingerprint(false, h);
         }
-        sorted
-            .fill_from_sorted(false, fingerprints.iter().copied())
-            .unwrap();
 
-        assert_eq!(regular.len(), sorted.len());
-        assert_eq!(
-            regular.fingerprints().collect::<Vec<_>>(),
-            sorted.fingerprints().collect::<Vec<_>>()
-        );
+        // Sorted insertion
+        let mut inserter = Builder::with_fingerprint_size(cap, fp_size).unwrap();
+        for &h in &fingerprints {
+            let _ = inserter.insert_fingerprint(false, h);
+        }
+        let sorted_f = inserter.into_filter();
+
+        assert_eq!(regular.len(), sorted_f.len());
+        let reg_fps: Vec<u64> = regular.fingerprints().collect();
+        let sort_fps: Vec<u64> = sorted_f.fingerprints().collect();
+        assert_eq!(reg_fps, sort_fps);
     }
 }

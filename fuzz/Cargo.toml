@@ -29,3 +29,15 @@ name = "fuzz_fingerprint"
 path = "fuzz_targets/fuzz_fingerprint.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_sorted_insert"
+path = "fuzz_targets/fuzz_sorted_insert.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_merge"
+path = "fuzz_targets/fuzz_merge.rs"
+test = false
+doc = false
