@@ -184,9 +184,11 @@ pub fn filter_specs(capacity: u64, fp_rate: f64) -> Result<FilterSpecs, Error> {
         return Err(Error::NotEnoughFingerprintBits);
     }
 
-    let memory_bytes_max = calculate_memory_bytes(qbits, rbits);
+    let memory_bytes_max = usize::try_from(calculate_memory_bytes(qbits, rbits))
+        .map_err(|_| Error::CapacityTooLarge)?;
     // Smallest resizable filter has 64 slots (qbits=6)
-    let memory_bytes_min = calculate_memory_bytes(6, fingerprint_bits - 6);
+    let memory_bytes_min = usize::try_from(calculate_memory_bytes(6, fingerprint_bits - 6))
+        .map_err(|_| Error::CapacityTooLarge)?;
     // Max capacity: 95% of slots
     let capacity = (slots * 19).div_ceil(20);
     // Max capacity error ratio based on rbits
@@ -214,10 +216,13 @@ pub fn filter_specs(capacity: u64, fp_rate: f64) -> Result<FilterSpecs, Error> {
 ///
 /// Total: num_blocks * (17 + 8 * rbits) + 8 bytes padding.
 /// The +8 padding allows branchless remainder reads (always reading 2 u64s).
-fn calculate_memory_bytes(qbits: u8, rbits: u8) -> usize {
+///
+/// Returns `u64` to avoid truncation on 32-bit targets. All callers that need `usize`
+/// use checked conversion (`usize::try_from`) and return an error on overflow.
+fn calculate_memory_bytes(qbits: u8, rbits: u8) -> u64 {
     let num_blocks = (1u64 << qbits) / 64;
-    let block_bytes = 17 + 8 * rbits as u64;
-    (num_blocks * block_bytes + 8) as usize
+    let block_bytes = 17 + 8 * rbits as u64; // see block layout in doc comment above
+    num_blocks * block_bytes + 8
 }
 
 /// Calculates the number of slots needed to fit the desired capacity with 95% max occupancy.
@@ -257,21 +262,14 @@ fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
 #[derive(Clone)]
 #[cfg_attr(
     feature = "serde",
-    derive(Serialize, Deserialize),
-    serde(bound(
-        serialize = "B: serde_bytes::Serialize",
-        deserialize = "B: serde_bytes::Deserialize<'de>"
-    ))
+    derive(Serialize),
+    serde(bound(serialize = "B: serde_bytes::Serialize"))
 )]
 #[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
 pub struct Filter<B = Box<[u8]>> {
     #[cfg_attr(
         feature = "serde",
-        serde(
-            rename = "b",
-            serialize_with = "serde_bytes::serialize",
-            deserialize_with = "serde_bytes::deserialize"
-        )
+        serde(rename = "b", serialize_with = "serde_bytes::serialize",)
     )]
     #[cfg_attr(feature = "jsonschema", schemars(with = "Vec<u8>"))]
     buffer: B,
@@ -283,6 +281,71 @@ pub struct Filter<B = Box<[u8]>> {
     rbits: NonZeroU8,
     #[cfg_attr(feature = "serde", serde(rename = "m"))]
     max_qbits: Option<NonZeroU8>,
+}
+
+/// Raw deserialization target for [`Filter`] that is validated before construction.
+#[cfg(feature = "serde")]
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "B: serde_bytes::Deserialize<'de>"))]
+struct FilterUnchecked<B> {
+    #[serde(rename = "b", deserialize_with = "serde_bytes::deserialize")]
+    buffer: B,
+    #[serde(rename = "l")]
+    len: u64,
+    #[serde(rename = "q")]
+    qbits: NonZeroU8,
+    #[serde(rename = "r")]
+    rbits: NonZeroU8,
+    #[serde(rename = "m")]
+    max_qbits: Option<NonZeroU8>,
+}
+
+#[cfg(feature = "serde")]
+impl<B: AsRef<[u8]>> FilterUnchecked<B> {
+    fn try_into_filter(self) -> Result<Filter<B>, &'static str> {
+        let qbits = self.qbits.get();
+        let rbits = self.rbits.get();
+        // qbits must be at least 6 (64 slots per block), within MAX_QBITS,
+        // and fingerprint must fit in 64 bits
+        if qbits < 6 || qbits > Filter::MAX_QBITS || qbits as u16 + rbits as u16 > 64 {
+            return Err("invalid qbits/rbits");
+        }
+        // buffer length must match the expected size for this qbits/rbits
+        // Compare as u64 to avoid truncation on 32-bit targets
+        let expected_bytes = calculate_memory_bytes(qbits, rbits);
+        if self.buffer.as_ref().len() as u64 != expected_bytes {
+            return Err("buffer length mismatch");
+        }
+        // len must not exceed total number of buckets
+        let total_buckets = 1u64 << qbits;
+        if self.len > total_buckets {
+            return Err("len exceeds total buckets");
+        }
+        // max_qbits must be >= qbits, <= MAX_QBITS, and within fingerprint bounds
+        if let Some(max_qbits) = self.max_qbits {
+            let mq = max_qbits.get();
+            if mq < qbits || mq > Filter::MAX_QBITS || mq as u16 > qbits as u16 + rbits as u16 - 1 {
+                return Err("invalid max_qbits");
+            }
+        }
+        Ok(Filter {
+            buffer: self.buffer,
+            len: self.len,
+            qbits: self.qbits,
+            rbits: self.rbits,
+            max_qbits: self.max_qbits,
+        })
+    }
+}
+
+/// The `AsRef<[u8]>` bound is required to validate the buffer length during deserialization.
+#[cfg(feature = "serde")]
+impl<'de, B: AsRef<[u8]> + serde_bytes::Deserialize<'de>> Deserialize<'de> for Filter<B> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        FilterUnchecked::<B>::deserialize(deserializer)?
+            .try_into_filter()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A read-only, borrowed view of a [`Filter`].
@@ -315,7 +378,7 @@ pub enum Error {
     IncompatibleFingerprintSize,
     /// The requested configuration requires more than 64 bits per fingerprint.
     NotEnoughFingerprintBits,
-    /// The requested capacity exceeds [`Filter::MAX_CAPACITY`].
+    /// The requested capacity exceeds [`Filter::MAX_CAPACITY`] or the platform's addressable range.
     CapacityTooLarge,
 }
 
@@ -1326,7 +1389,8 @@ impl Filter {
         if qbits.get() + rbits.get() > 64 {
             return Err(Error::NotEnoughFingerprintBits);
         }
-        let buffer_bytes = calculate_memory_bytes(qbits.get(), rbits.get());
+        let buffer_bytes = usize::try_from(calculate_memory_bytes(qbits.get(), rbits.get()))
+            .map_err(|_| Error::CapacityTooLarge)?;
         let buffer = vec![0u8; buffer_bytes].into_boxed_slice();
         Ok(Self {
             buffer,
@@ -2745,6 +2809,72 @@ mod tests {
         let fps: Vec<u64> = f.fingerprints().collect();
         let ref_fps: Vec<u64> = fr.fingerprints().collect();
         assert_eq!(fps, ref_fps);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_rejects_invalid() {
+        // Valid filter to use as a base for tampering
+        let f = Filter::new(100, 0.01).unwrap();
+        let ser = serde_cbor::to_vec(&f).unwrap();
+
+        // Valid deserialization works
+        let _: Filter = serde_cbor::from_slice(&ser).unwrap();
+
+        // Tamper with qbits to an invalid value (too small)
+        let mut tampered: serde_cbor::Value = serde_cbor::from_slice(&ser).unwrap();
+        if let serde_cbor::Value::Map(ref mut map) = tampered {
+            map.insert(
+                serde_cbor::Value::Text("q".into()),
+                serde_cbor::Value::Integer(1), // qbits=1, way too small
+            );
+        }
+        let tampered_bytes = serde_cbor::to_vec(&tampered).unwrap();
+        assert!(serde_cbor::from_slice::<Filter>(&tampered_bytes).is_err());
+
+        // Tamper with buffer length (truncate)
+        let mut tampered: serde_cbor::Value = serde_cbor::from_slice(&ser).unwrap();
+        if let serde_cbor::Value::Map(ref mut map) = tampered {
+            map.insert(
+                serde_cbor::Value::Text("b".into()),
+                serde_cbor::Value::Bytes(vec![0; 8]),
+            );
+        }
+        let tampered_bytes = serde_cbor::to_vec(&tampered).unwrap();
+        assert!(serde_cbor::from_slice::<Filter>(&tampered_bytes).is_err());
+
+        // Tamper with len to exceed total buckets
+        let mut tampered: serde_cbor::Value = serde_cbor::from_slice(&ser).unwrap();
+        if let serde_cbor::Value::Map(ref mut map) = tampered {
+            map.insert(
+                serde_cbor::Value::Text("l".into()),
+                serde_cbor::Value::Integer(i128::from(u64::MAX)),
+            );
+        }
+        let tampered_bytes = serde_cbor::to_vec(&tampered).unwrap();
+        assert!(serde_cbor::from_slice::<Filter>(&tampered_bytes).is_err());
+
+        // Tamper with qbits to exceed MAX_QBITS
+        let mut tampered: serde_cbor::Value = serde_cbor::from_slice(&ser).unwrap();
+        if let serde_cbor::Value::Map(ref mut map) = tampered {
+            map.insert(
+                serde_cbor::Value::Text("q".into()),
+                serde_cbor::Value::Integer(63),
+            );
+        }
+        let tampered_bytes = serde_cbor::to_vec(&tampered).unwrap();
+        assert!(serde_cbor::from_slice::<Filter>(&tampered_bytes).is_err());
+
+        // Tamper with max_qbits to exceed qbits + rbits - 1
+        let mut tampered: serde_cbor::Value = serde_cbor::from_slice(&ser).unwrap();
+        if let serde_cbor::Value::Map(ref mut map) = tampered {
+            map.insert(
+                serde_cbor::Value::Text("m".into()),
+                serde_cbor::Value::Integer(60),
+            );
+        }
+        let tampered_bytes = serde_cbor::to_vec(&tampered).unwrap();
+        assert!(serde_cbor::from_slice::<Filter>(&tampered_bytes).is_err());
     }
 
     #[test]
