@@ -79,6 +79,13 @@ use stable_hasher::StableHasher;
 mod portable_select;
 mod stable_hasher;
 
+#[inline]
+fn hash_item<T: Hash>(item: T) -> u64 {
+    let mut hasher = StableHasher::new();
+    item.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Computes a truncated fingerprint for the given item.
 ///
 /// Uses the same stable hash algorithm (xxhash3) as [`Filter`].
@@ -99,9 +106,7 @@ mod stable_hasher;
 /// ```
 #[inline]
 pub fn compute_fingerprint<T: Hash>(item: T, fingerprint_bits: u8) -> u64 {
-    let mut hasher = StableHasher::new();
-    item.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = hash_item(item);
     if fingerprint_bits >= 64 {
         hash
     } else {
@@ -245,10 +250,21 @@ fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
 ///
 /// The public API also exposes a fingerprint API, which can be used to succinctly store u64
 /// hash values.
+///
+/// The type parameter `B` controls the buffer storage. Use `Filter` (defaults to `Box<[u8]>`)
+/// for an owned, mutable filter or [`FilterRef`] (`Filter<&[u8]>`) for a borrowed, read-only view
+/// that supports zero-copy deserialization.
 #[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(bound(
+        serialize = "B: serde_bytes::Serialize",
+        deserialize = "B: serde_bytes::Deserialize<'de>"
+    ))
+)]
 #[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
-pub struct Filter {
+pub struct Filter<B = Box<[u8]>> {
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -257,7 +273,8 @@ pub struct Filter {
             deserialize_with = "serde_bytes::deserialize"
         )
     )]
-    buffer: Box<[u8]>,
+    #[cfg_attr(feature = "jsonschema", schemars(with = "Vec<u8>"))]
+    buffer: B,
     #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
     #[cfg_attr(feature = "serde", serde(rename = "q"))]
@@ -267,6 +284,26 @@ pub struct Filter {
     #[cfg_attr(feature = "serde", serde(rename = "m"))]
     max_qbits: Option<NonZeroU8>,
 }
+
+/// A read-only, borrowed view of a [`Filter`].
+///
+/// This is a type alias for `Filter<&[u8]>`. It supports all read-only operations
+/// ([`contains`](Filter::contains), [`count`](Filter::count),
+/// [`fingerprints`](Filter::fingerprints), etc.) and enables zero-copy deserialization
+/// from binary formats like CBOR, bincode, or postcard via serde.
+///
+/// # Zero-copy deserialization
+///
+/// ```rust,ignore
+/// // Deserialize without copying the buffer
+/// let filter_ref: FilterRef = serde_cbor::from_slice(&bytes).unwrap();
+/// assert!(filter_ref.contains("hello"));
+/// ```
+///
+/// Use [`FilterRef::to_owned()`](Filter::to_owned) to convert to a [`Filter`] when mutation is needed.
+pub type FilterRef<'a> = Filter<&'a [u8]>;
+
+impl Copy for Filter<&[u8]> {}
 
 /// Errors returned by [`Filter`] operations.
 #[derive(Debug)]
@@ -464,40 +501,45 @@ impl CastNonZeroU8 for NonZeroU8 {
     }
 }
 
-/// Private trait abstracting buffer access for shared read-only implementations.
-///
-/// Both [`Filter`] (owned) and [`FilterRef`] (borrowed) implement this trait,
-/// enabling all read-only query methods to be written once as default implementations.
-trait FilterBuf {
-    fn buffer(&self) -> &[u8];
-    fn filter_len(&self) -> u64;
-    fn qbits(&self) -> NonZeroU8;
-    fn rbits(&self) -> NonZeroU8;
-    fn max_qbits_opt(&self) -> Option<NonZeroU8>;
-
+// Read-only methods available on any Filter<B> where the buffer can be read as &[u8].
+// This covers both Filter (owned, B=Box<[u8]>) and FilterRef (borrowed, B=&[u8]).
+impl<B: AsRef<[u8]>> Filter<B> {
+    /// Returns the fingerprint size in bits.
+    ///
+    /// Use this with [`compute_fingerprint()`] to create compatible fingerprints.
     #[inline]
-    fn fingerprint_size(&self) -> u8 {
-        self.qbits().get() + self.rbits().get()
+    pub fn fingerprint_size(&self) -> u8 {
+        self.qbits.get() + self.rbits.get()
     }
 
+    /// Returns `true` if the filter contains no items.
     #[inline]
-    fn is_empty(&self) -> bool {
-        self.filter_len() == 0
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
+    /// Returns the number of items in the filter.
     #[inline]
-    fn memory_usage(&self) -> usize {
-        self.buffer().len()
+    pub fn len(&self) -> u64 {
+        self.len
     }
 
+    /// Returns the memory usage in bytes.
     #[inline]
-    fn max_capacity(&self) -> u64 {
+    pub fn memory_usage(&self) -> usize {
+        self.buffer.as_ref().len()
+    }
+
+    /// Returns the maximum capacity after all possible growth.
+    #[inline]
+    pub fn max_capacity(&self) -> u64 {
         // Overflow is not possible here as it'd have overflowed in the constructor.
-        ((1u64 << self.max_qbits_opt().unwrap_or(self.qbits()).get()) * 19).div_ceil(20)
+        ((1u64 << self.max_qbits.unwrap_or(self.qbits).get()) * 19).div_ceil(20)
     }
 
+    /// Returns the current capacity (before next growth).
     #[inline]
-    fn capacity(&self) -> u64 {
+    pub fn capacity(&self) -> u64 {
         if cfg!(fuzzing) {
             // 100% occupancy is not realistic but stresses the algorithm much more.
             // To generate real counter examples this "pessimisation" must be removed.
@@ -510,25 +552,34 @@ trait FilterBuf {
         }
     }
 
-    fn max_error_ratio_resizeable(&self) -> f64 {
-        let extra_rbits = self.max_qbits_opt().unwrap_or(self.qbits()).get() - self.qbits().get();
-        2f64.powi(-((self.rbits().get() - extra_rbits) as i32))
+    /// Returns the false positive rate when fully grown (`len == max_capacity()`).
+    pub fn max_error_ratio_resizeable(&self) -> f64 {
+        let extra_rbits = self.max_qbits.unwrap_or(self.qbits).get() - self.qbits.get();
+        2f64.powi(-((self.rbits.get() - extra_rbits) as i32))
     }
 
-    fn max_error_ratio(&self) -> f64 {
-        2f64.powi(-(self.rbits().get() as i32))
+    /// Returns the false positive rate at current capacity (`len == capacity()`).
+    pub fn max_error_ratio(&self) -> f64 {
+        2f64.powi(-(self.rbits.get() as i32))
     }
 
-    fn current_error_ratio(&self) -> f64 {
-        let occupancy = self.filter_len() as f64 / self.total_buckets().get() as f64;
-        1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits().get() as i32))
+    /// Returns the estimated false positive rate at current occupancy.
+    pub fn current_error_ratio(&self) -> f64 {
+        let occupancy = self.len as f64 / self.total_buckets().get() as f64;
+        1.0 - std::f64::consts::E.powf(-occupancy / 2f64.powi(self.rbits.get() as i32))
     }
 
-    fn contains<T: Hash>(&self, item: T) -> bool {
+    /// Returns `true` if the item is probably in the filter, `false` if definitely not.
+    ///
+    /// May return false positives but never false negatives.
+    pub fn contains<T: Hash>(&self, item: T) -> bool {
         self.contains_fingerprint(self.hash_item(item))
     }
 
-    fn contains_fingerprint(&self, hash: u64) -> bool {
+    /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
+    ///
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
+    pub fn contains_fingerprint(&self, hash: u64) -> bool {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return false;
@@ -545,11 +596,17 @@ trait FilterBuf {
         }
     }
 
-    fn count<T: Hash>(&self, item: T) -> u64 {
+    /// Returns how many times the item appears in the filter (approximate).
+    ///
+    /// Only meaningful if duplicates were inserted via [`Filter::insert_duplicated()`].
+    pub fn count<T: Hash>(&self, item: T) -> u64 {
         self.count_fingerprint(self.hash_item(item))
     }
 
-    fn count_fingerprint(&self, hash: u64) -> u64 {
+    /// Returns how many times the fingerprint appears in the filter (approximate).
+    ///
+    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
+    pub fn count_fingerprint(&self, hash: u64) -> u64 {
         let (hash_bucket_idx, hash_remainder) = self.calc_qr(hash);
         if !self.is_occupied(hash_bucket_idx) {
             return 0;
@@ -568,17 +625,42 @@ trait FilterBuf {
         }
     }
 
+    /// Returns an iterator over the fingerprints stored in the filter.
+    ///
+    /// Fingerprints are yielded in ascending order. Each value has only the lower
+    /// [`Self::fingerprint_size()`] bits set (upper bits are zero).
+    ///
+    /// This is useful for serialization, migrating data between filters, or
+    /// inspecting stored values. Use [`compute_fingerprint()`] to compute a
+    /// fingerprint compatible with this filter's size.
+    pub fn fingerprints(&self) -> FingerprintIter<'_> {
+        FingerprintIter::new(self)
+    }
+
+    /// Returns a borrowed [`FilterRef`] view of this filter.
+    #[inline]
+    pub fn as_filter_ref(&self) -> FilterRef<'_> {
+        FilterRef {
+            buffer: self.buffer.as_ref(),
+            len: self.len,
+            qbits: self.qbits,
+            rbits: self.rbits,
+            max_qbits: self.max_qbits,
+        }
+    }
+
     #[inline]
     fn block_byte_size(&self) -> usize {
-        1 + 8 + 8 + 64 * self.rbits().usize() / 8
+        1 + 8 + 8 + 64 * self.rbits.usize() / 8
     }
 
     // SAFETY: Caller must ensure offset + 8 <= buffer.len()
     #[inline(always)]
     unsafe fn read_u64_unchecked(&self, offset: usize) -> u64 {
-        debug_assert!(offset + 8 <= self.buffer().len());
+        debug_assert!(offset + 8 <= self.buffer.as_ref().len());
         u64::from_le_bytes(
-            self.buffer()
+            self.buffer
+                .as_ref()
                 .get_unchecked(offset..offset + 8)
                 .try_into()
                 .unwrap_unchecked(),
@@ -592,7 +674,7 @@ trait FilterBuf {
         // SAFETY: block_num % total_blocks() guarantees valid block index
         unsafe {
             Block {
-                offset: *self.buffer().get_unchecked(block_start) as u64,
+                offset: *self.buffer.as_ref().get_unchecked(block_start) as u64,
                 occupieds: self.read_u64_unchecked(block_start + 1),
                 runends: self.read_u64_unchecked(block_start + 1 + 8),
             }
@@ -617,10 +699,10 @@ trait FilterBuf {
 
     #[inline(always)]
     fn get_remainder(&self, hash_bucket_idx: u64) -> u64 {
-        debug_assert!(self.rbits().get() > 0 && self.rbits().get() < 64);
+        debug_assert!(self.rbits.get() > 0 && self.rbits.get() < 64);
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let remainders_start = (hash_bucket_idx / 64) as usize * self.block_byte_size() + 1 + 8 + 8;
-        let start_bit_idx = self.rbits().usize() * (hash_bucket_idx % 64) as usize;
+        let start_bit_idx = self.rbits.usize() * (hash_bucket_idx % 64) as usize;
         let start_u64 = start_bit_idx / 64;
         let extra_low = start_bit_idx - start_u64 * 64;
 
@@ -629,9 +711,9 @@ trait FilterBuf {
         let rem_part1 = unsafe { self.read_u64_unchecked(remainders_start + (start_u64 + 1) * 8) };
 
         let combined = (rem_part0 as u128) | ((rem_part1 as u128) << 64);
-        let remainder = (combined >> extra_low) as u64 & ((1u64 << self.rbits().get()) - 1);
+        let remainder = (combined >> extra_low) as u64 & ((1u64 << self.rbits.get()) - 1);
 
-        debug_assert!(remainder.leading_zeros() >= 64 - self.rbits().get() as u32);
+        debug_assert!(remainder.leading_zeros() >= 64 - self.rbits.get() as u32);
         remainder
     }
 
@@ -759,15 +841,13 @@ trait FilterBuf {
 
     #[inline]
     fn hash_item<T: Hash>(&self, item: T) -> u64 {
-        let mut hasher = StableHasher::new();
-        item.hash(&mut hasher);
-        hasher.finish()
+        hash_item(item)
     }
 
     #[inline]
     fn calc_qr(&self, hash: u64) -> (u64, u64) {
-        let hash_bucket_idx = (hash >> self.rbits().get()) & ((1 << self.qbits().get()) - 1);
-        let remainder = hash & ((1 << self.rbits().get()) - 1);
+        let hash_bucket_idx = (hash >> self.rbits.get()) & ((1 << self.qbits.get()) - 1);
+        let remainder = hash & ((1 << self.rbits.get()) - 1);
         (hash_bucket_idx, remainder)
     }
 
@@ -776,7 +856,7 @@ trait FilterBuf {
         // The way this is calculated ensures the compilers sees that the result is both != 0 and a power of 2,
         // both of which allow the optimizer to generate much faster division/remainder code.
         // Safety: qbits in 6..=63, so (1 << qbits) / 64 is in 1..=2^57
-        unsafe { NonZeroU64::new_unchecked((1u64 << self.qbits().get()) / 64) }
+        unsafe { NonZeroU64::new_unchecked((1u64 << self.qbits.get()) / 64) }
     }
 
     #[inline]
@@ -784,103 +864,24 @@ trait FilterBuf {
         // The way this is calculated ensures the compilers sees that the result is both != 0 and a power of 2,
         // both of which allow the optimizer to generate much faster division/remainder code.
         // Safety: qbits in 6..=63, so 1 << qbits is in 64..=2^63
-        unsafe { NonZeroU64::new_unchecked(1u64 << self.qbits().get()) }
+        unsafe { NonZeroU64::new_unchecked(1u64 << self.qbits.get()) }
     }
 }
 
-impl FilterBuf for Filter {
-    #[inline]
-    fn buffer(&self) -> &[u8] {
-        &self.buffer
-    }
-    #[inline]
-    fn filter_len(&self) -> u64 {
-        self.len
-    }
-    #[inline]
-    fn qbits(&self) -> NonZeroU8 {
-        self.qbits
-    }
-    #[inline]
-    fn rbits(&self) -> NonZeroU8 {
-        self.rbits
-    }
-    #[inline]
-    fn max_qbits_opt(&self) -> Option<NonZeroU8> {
-        self.max_qbits
+impl<B: AsRef<[u8]>> std::fmt::Debug for Filter<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Filter")
+            .field("buffer", &"[..]")
+            .field("len", &self.len)
+            .field("qbits", &self.qbits)
+            .field("rbits", &self.rbits)
+            .field("max_qbits", &self.max_qbits)
+            .finish()
     }
 }
 
-/// A read-only, borrowed view of a [`Filter`].
-///
-/// This type holds borrowed references to filter data, enabling zero-copy
-/// deserialization from binary formats like CBOR, bincode, or postcard via serde.
-///
-/// `FilterRef` supports all read-only operations: [`contains`](FilterRef::contains),
-/// [`count`](FilterRef::count), [`fingerprints`](FilterRef::fingerprints), etc.
-///
-/// # Zero-copy deserialization
-///
-/// ```rust,ignore
-/// // Deserialize without copying the buffer
-/// let filter_ref: FilterRef = serde_cbor::from_slice(&bytes).unwrap();
-/// assert!(filter_ref.contains("hello"));
-/// ```
-///
-/// Use [`FilterRef::to_owned()`] to convert to a [`Filter`] when mutation is needed.
-#[cfg(feature = "serde")]
-#[derive(Clone, Copy, Deserialize)]
-#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-pub struct FilterRef<'a> {
-    #[serde(rename = "b", borrow, deserialize_with = "serde_bytes::deserialize")]
-    buffer: &'a [u8],
-    #[serde(rename = "l")]
-    len: u64,
-    #[serde(rename = "q")]
-    qbits: NonZeroU8,
-    #[serde(rename = "r")]
-    rbits: NonZeroU8,
-    #[serde(rename = "m")]
-    max_qbits: Option<NonZeroU8>,
-}
-
-/// Internal borrowed view used by [`FingerprintIter`].
-#[cfg(not(feature = "serde"))]
-#[derive(Clone, Copy)]
-pub(crate) struct FilterRef<'a> {
-    buffer: &'a [u8],
-    len: u64,
-    qbits: NonZeroU8,
-    rbits: NonZeroU8,
-    max_qbits: Option<NonZeroU8>,
-}
-
-impl<'a> FilterBuf for FilterRef<'a> {
-    #[inline]
-    fn buffer(&self) -> &[u8] {
-        self.buffer
-    }
-    #[inline]
-    fn filter_len(&self) -> u64 {
-        self.len
-    }
-    #[inline]
-    fn qbits(&self) -> NonZeroU8 {
-        self.qbits
-    }
-    #[inline]
-    fn rbits(&self) -> NonZeroU8 {
-        self.rbits
-    }
-    #[inline]
-    fn max_qbits_opt(&self) -> Option<NonZeroU8> {
-        self.max_qbits
-    }
-}
-
-#[cfg(feature = "serde")]
-impl<'a> FilterRef<'a> {
-
+/// Converts a borrowed [`FilterRef`] into an owned [`Filter`].
+impl FilterRef<'_> {
     /// Converts this borrowed filter view into an owned [`Filter`].
     pub fn to_owned(&self) -> Filter {
         Filter {
@@ -891,109 +892,8 @@ impl<'a> FilterRef<'a> {
             max_qbits: self.max_qbits,
         }
     }
-
-    /// Returns the fingerprint size in bits.
-    #[inline]
-    pub fn fingerprint_size(&self) -> u8 {
-        FilterBuf::fingerprint_size(self)
-    }
-
-    /// Returns `true` if the filter contains no items.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        FilterBuf::is_empty(self)
-    }
-
-    /// Returns the number of items in the filter.
-    #[inline]
-    pub fn len(&self) -> u64 {
-        self.filter_len()
-    }
-
-    /// Returns the memory usage in bytes.
-    #[inline]
-    pub fn memory_usage(&self) -> usize {
-        FilterBuf::memory_usage(self)
-    }
-
-    /// Returns the maximum capacity after all possible growth.
-    #[inline]
-    pub fn max_capacity(&self) -> u64 {
-        FilterBuf::max_capacity(self)
-    }
-
-    /// Returns the current capacity (before next growth).
-    #[inline]
-    pub fn capacity(&self) -> u64 {
-        FilterBuf::capacity(self)
-    }
-
-    /// Returns the false positive rate when fully grown (`len == max_capacity()`).
-    pub fn max_error_ratio_resizeable(&self) -> f64 {
-        FilterBuf::max_error_ratio_resizeable(self)
-    }
-
-    /// Returns the false positive rate at current capacity (`len == capacity()`).
-    pub fn max_error_ratio(&self) -> f64 {
-        FilterBuf::max_error_ratio(self)
-    }
-
-    /// Returns the estimated false positive rate at current occupancy.
-    pub fn current_error_ratio(&self) -> f64 {
-        FilterBuf::current_error_ratio(self)
-    }
-
-    /// Returns `true` if the item is probably in the filter, `false` if definitely not.
-    ///
-    /// May return false positives but never false negatives.
-    pub fn contains<T: Hash>(&self, item: T) -> bool {
-        FilterBuf::contains(self, item)
-    }
-
-    /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
-    ///
-    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
-    pub fn contains_fingerprint(&self, hash: u64) -> bool {
-        FilterBuf::contains_fingerprint(self, hash)
-    }
-
-    /// Returns how many times the item appears in the filter (approximate).
-    ///
-    /// Only meaningful if duplicates were inserted via [`Filter::insert_duplicated()`].
-    pub fn count<T: Hash>(&self, item: T) -> u64 {
-        FilterBuf::count(self, item)
-    }
-
-    /// Returns how many times the fingerprint appears in the filter (approximate).
-    ///
-    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
-    pub fn count_fingerprint(&self, hash: u64) -> u64 {
-        FilterBuf::count_fingerprint(self, hash)
-    }
-
-    /// Returns an iterator over the fingerprints stored in the filter.
-    ///
-    /// Fingerprints are yielded in ascending order. Each value has only the lower
-    /// [`Self::fingerprint_size()`] bits set (upper bits are zero).
-    pub fn fingerprints(&self) -> FingerprintIter<'a> {
-        FingerprintIter::new_ref(*self)
-    }
 }
 
-#[cfg(feature = "serde")]
-impl std::fmt::Debug for FilterRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FilterRef")
-            .field("buffer", &"[..]")
-            .field("len", &self.len)
-            .field("qbits", &self.qbits)
-            .field("rbits", &self.rbits)
-            .field("max_qbits", &self.max_qbits)
-            .finish()
-    }
-}
-
-#[cfg(feature = "serde")]
 impl<'a> IntoIterator for FilterRef<'a> {
     type Item = u64;
     type IntoIter = FingerprintIter<'a>;
@@ -1001,7 +901,7 @@ impl<'a> IntoIterator for FilterRef<'a> {
     /// Returns an iterator over the fingerprints stored in the filter.
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.fingerprints()
+        FingerprintIter::from_ref(self)
     }
 }
 
@@ -1025,11 +925,11 @@ pub struct FingerprintIter<'a> {
 }
 
 impl<'a> FingerprintIter<'a> {
-    fn new(filter: &'a Filter) -> Self {
-        Self::new_ref(filter.as_filter_ref())
+    fn new<B: AsRef<[u8]>>(filter: &'a Filter<B>) -> Self {
+        Self::from_ref(filter.as_filter_ref())
     }
 
-    fn new_ref(filter: FilterRef<'a>) -> Self {
+    fn from_ref(filter: FilterRef<'a>) -> Self {
         let mut q_block_idx = 0u64;
         let mut cached_occupieds = filter.raw_block(0).occupieds;
         if !filter.is_empty() {
@@ -1047,7 +947,7 @@ impl<'a> FingerprintIter<'a> {
             filter,
             q_bucket_idx,
             r_bucket_idx,
-            remaining: filter.filter_len(),
+            remaining: filter.len,
             q_block_idx,
             r_block_idx,
             cached_occupieds,
@@ -1063,7 +963,7 @@ impl Iterator for FingerprintIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         self.remaining = self.remaining.checked_sub(1)?;
 
-        let hash = (self.q_bucket_idx << self.filter.rbits().get())
+        let hash = (self.q_bucket_idx << self.filter.rbits.get())
             | self.filter.get_remainder(self.r_bucket_idx);
 
         let is_runend = self
@@ -1458,122 +1358,10 @@ impl Filter {
         );
     }
 
-    /// Returns a borrowed [`FilterRef`] view of this filter.
-    #[cfg(feature = "serde")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
-    #[inline]
-    pub fn as_ref(&self) -> FilterRef<'_> {
-        self.as_filter_ref()
-    }
-
-    #[inline]
-    fn as_filter_ref(&self) -> FilterRef<'_> {
-        FilterRef {
-            buffer: &self.buffer,
-            len: self.len,
-            qbits: self.qbits,
-            rbits: self.rbits,
-            max_qbits: self.max_qbits,
-        }
-    }
-
-    /// Returns the fingerprint size in bits.
-    ///
-    /// Use this with [`compute_fingerprint()`] to create compatible fingerprints.
-    #[inline]
-    pub fn fingerprint_size(&self) -> u8 {
-        FilterBuf::fingerprint_size(self)
-    }
-
-    /// Returns `true` if the filter contains no items.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        FilterBuf::is_empty(self)
-    }
-
-    /// Returns the number of items in the filter.
-    #[inline]
-    pub fn len(&self) -> u64 {
-        self.filter_len()
-    }
-
-    /// Returns the memory usage in bytes.
-    #[inline]
-    pub fn memory_usage(&self) -> usize {
-        FilterBuf::memory_usage(self)
-    }
-
     /// Removes all items from the filter.
     pub fn clear(&mut self) {
         self.buffer.fill(0);
         self.len = 0;
-    }
-
-    /// Returns the maximum capacity after all possible growth.
-    #[inline]
-    pub fn max_capacity(&self) -> u64 {
-        FilterBuf::max_capacity(self)
-    }
-
-    /// Returns the current capacity (before next growth).
-    #[inline]
-    pub fn capacity(&self) -> u64 {
-        FilterBuf::capacity(self)
-    }
-
-    /// Returns the false positive rate when fully grown (`len == max_capacity()`).
-    pub fn max_error_ratio_resizeable(&self) -> f64 {
-        FilterBuf::max_error_ratio_resizeable(self)
-    }
-
-    /// Returns the false positive rate at current capacity (`len == capacity()`).
-    pub fn max_error_ratio(&self) -> f64 {
-        FilterBuf::max_error_ratio(self)
-    }
-
-    /// Returns the estimated false positive rate at current occupancy.
-    pub fn current_error_ratio(&self) -> f64 {
-        FilterBuf::current_error_ratio(self)
-    }
-
-    /// Returns `true` if the item is probably in the filter, `false` if definitely not.
-    ///
-    /// May return false positives but never false negatives.
-    pub fn contains<T: Hash>(&self, item: T) -> bool {
-        FilterBuf::contains(self, item)
-    }
-
-    /// Returns `true` if the fingerprint is probably in the filter, `false` if definitely not.
-    ///
-    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
-    pub fn contains_fingerprint(&self, hash: u64) -> bool {
-        FilterBuf::contains_fingerprint(self, hash)
-    }
-
-    /// Returns how many times the item appears in the filter (approximate).
-    ///
-    /// Only meaningful if duplicates were inserted via [`Self::insert_duplicated()`].
-    pub fn count<T: Hash>(&self, item: T) -> u64 {
-        FilterBuf::count(self, item)
-    }
-
-    /// Returns how many times the fingerprint appears in the filter (approximate).
-    ///
-    /// Only the lower [`Self::fingerprint_size()`] bits of `hash` are used.
-    pub fn count_fingerprint(&self, hash: u64) -> u64 {
-        FilterBuf::count_fingerprint(self, hash)
-    }
-
-    /// Returns an iterator over the fingerprints stored in the filter.
-    ///
-    /// Fingerprints are yielded in ascending order. Each value has only the lower
-    /// [`Self::fingerprint_size()`] bits set (upper bits are zero).
-    ///
-    /// This is useful for serialization, migrating data between filters, or
-    /// inspecting stored values. Use [`compute_fingerprint()`] to compute a
-    /// fingerprint compatible with this filter's size.
-    pub fn fingerprints(&self) -> FingerprintIter<'_> {
-        FingerprintIter::new(self)
     }
 
     #[inline]
@@ -2199,7 +1987,11 @@ impl Filter {
     ///     assert!(filter1.contains(i));
     /// }
     /// ```
-    pub fn merge(&mut self, keep_duplicates: bool, other: &Self) -> Result<(), Error> {
+    pub fn merge(
+        &mut self,
+        keep_duplicates: bool,
+        other: &Filter<impl AsRef<[u8]>>,
+    ) -> Result<(), Error> {
         if self.fingerprint_size() == other.fingerprint_size() {
             *self = self.merge_sorted(keep_duplicates, other)?;
         } else if other.fingerprint_size() >= self.fingerprint_size() {
@@ -2219,7 +2011,11 @@ impl Filter {
     ///
     /// Both iterators yield fingerprints in the same sorted order because
     /// the filters have identical fingerprint sizes (same qbits/rbits split).
-    fn merge_sorted(&self, keep_duplicates: bool, other: &Self) -> Result<Filter, Error> {
+    fn merge_sorted(
+        &self,
+        keep_duplicates: bool,
+        other: &Filter<impl AsRef<[u8]>>,
+    ) -> Result<Filter, Error> {
         debug_assert_eq!(self.fingerprint_size(), other.fingerprint_size());
         // Preserve growth headroom from self.
         // Pre-size to avoid intermediate growths, capped by self's max_qbits.
@@ -2324,18 +2120,6 @@ impl Filter {
             println!();
         }
         eprintln!("===");
-    }
-}
-
-impl std::fmt::Debug for Filter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Filter")
-            .field("buffer", &"[..]")
-            .field("len", &self.len)
-            .field("qbits", &self.qbits)
-            .field("rbits", &self.rbits)
-            .field("max_qbits", &self.max_qbits)
-            .finish()
     }
 }
 
@@ -2951,7 +2735,7 @@ mod tests {
             f.insert(i).unwrap();
         }
 
-        let fr = f.as_ref();
+        let fr = f.as_filter_ref();
         assert_eq!(fr.len(), f.len());
         assert_eq!(fr.fingerprint_size(), f.fingerprint_size());
         for i in 0..50u64 {
