@@ -36,6 +36,23 @@ jobs:
       - run: cargo test --no-default-features
       - run: cargo test --all-features
 
+  cross-platform-test:
+    name: Cross-platform tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - powerpc-unknown-linux-gnu    # 32-bit big-endian
+          - i686-unknown-linux-gnu       # 32-bit little-endian
+          - aarch64-unknown-linux-gnu    # 64-bit little-endian (ARM)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - run: cross test --features serde --target ${{ matrix.target }} --lib
+
   fuzz-tests:
     name: Fuzz tests
     runs-on: ubuntu-latest
