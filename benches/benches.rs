@@ -167,15 +167,17 @@ fn bench_fingerprints(c: &mut Criterion) {
 }
 
 fn bench_sorted_insert(c: &mut Criterion) {
-    let inserter = Builder::new(10000, 0.01).unwrap();
+    let inserter = Builder::new(Filter::new(10000, 0.01).unwrap());
     let fp_size = inserter.fingerprint_size();
     let cap = inserter.capacity();
-    let mut fingerprints: Vec<u64> = (0..cap).map(|i| compute_fingerprint(i, fp_size)).collect();
+    let mut fingerprints: Vec<u64> = (0..cap)
+        .map(|i| compute_fingerprint_with_hasher(&StableBuildHasher, i, fp_size))
+        .collect();
     fingerprints.sort_unstable();
 
     c.bench_function("sorted_insert", |b| {
         b.iter(|| {
-            let mut inserter = Builder::new(10000, 0.01).unwrap();
+            let mut inserter = Builder::new(Filter::new(10000, 0.01).unwrap());
             for &h in &fingerprints {
                 inserter.insert_fingerprint(true, h).unwrap();
             }

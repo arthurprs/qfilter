@@ -18,8 +18,23 @@
 //!
 //! ### Hasher
 //!
-//! The hashing algorithm used is [xxhash3](https://crates.io/crates/xxhash-rust)
-//! which offers both high performance and stability across platforms.
+//! Methods accepting `T: Hash` are provided for convenience using
+//! [foldhash-portable](https://crates.io/crates/foldhash-portable), which offers high performance
+//! and stability across platforms. Note that a fixed seed is used (no DoS resistance)
+//! and `#[derive(Hash)]` output is [not guaranteed stable](https://github.com/hoxxep/portable-hash#whats-wrong-with-the-stdhash-traits)
+//! across Rust compiler versions.
+//!
+//! ### Custom hasher
+//!
+//! [`Filter`] supports a custom [`BuildHasher`] via its `S` type
+//! parameter (similar to [`HashMap`](std::collections::HashMap)). Use
+//! [`Filter::new_with_hasher()`] and related constructors. Caveats:
+//!
+//! - The hasher is **not serialized**. On deserialization it is reconstructed via `S::default()`.
+//!   If that doesn't produce the correct hasher (e.g. random-seeded hashers), use
+//!   [`Filter::with_hasher()`] to restore it.
+//! - Filters being **merged** must use the same hasher and seed.
+//! - The **same hasher instance** (or equivalent seed) must be used for all operations.
 //!
 //! ### Filter size
 //!
@@ -65,7 +80,7 @@
 
 use std::{
     cmp::Ordering,
-    hash::{Hash, Hasher},
+    hash::{BuildHasher, Hash},
     num::{NonZeroU64, NonZeroU8},
     ops::{RangeBounds, RangeFrom},
 };
@@ -74,44 +89,51 @@ use std::{
 use schemars::JsonSchema;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use stable_hasher::StableHasher;
+pub use stable_hasher::StableBuildHasher;
 
 mod portable_select;
 mod stable_hasher;
 
-#[inline]
-fn hash_item<T: Hash>(item: T) -> u64 {
-    let mut hasher = StableHasher::new();
-    item.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Computes a truncated fingerprint for the given item.
+/// Truncates a hash to a fingerprint of the given bit size.
 ///
-/// Uses the same stable hash algorithm (xxhash3) as [`Filter`].
-/// Only the lower `fingerprint_bits` bits of the hash are returned.
+/// Only the lower `fingerprint_bits` bits of `hash` are returned.
+/// This is useful when pre-computing fingerprints for [`Builder`] sorted insertion,
+/// which requires truncated fingerprints for correct sort order.
+///
+/// In most other cases you don't need this — the fingerprint-based APIs
+/// ([`Filter::contains_fingerprint()`], [`Filter::insert_fingerprint()`], etc.) accept
+/// full untruncated hashes and truncate internally.
 ///
 /// - `fingerprint_bits == 0` returns `0`
-/// - `fingerprint_bits >= 64` returns the full 64-bit hash
-///
-/// # Example
-///
-/// ```rust
-/// use qfilter::{compute_fingerprint, Filter};
-///
-/// let mut filter = Filter::new(100, 0.01).unwrap();
-/// filter.insert("hello").unwrap();
-/// let fp = compute_fingerprint("hello", filter.fingerprint_size());
-/// assert!(filter.contains_fingerprint(fp));
-/// ```
+/// - `fingerprint_bits >= 64` returns the full hash unchanged
 #[inline]
-pub fn compute_fingerprint<T: Hash>(item: T, fingerprint_bits: u8) -> u64 {
-    let hash = hash_item(item);
+pub fn truncate_to_fingerprint(hash: u64, fingerprint_bits: u8) -> u64 {
     if fingerprint_bits >= 64 {
         hash
     } else {
         hash & ((1u64 << fingerprint_bits) - 1)
     }
+}
+
+/// Hashes an item and truncates it to a fingerprint of the given bit size.
+///
+/// Equivalent to `truncate_to_fingerprint(build_hasher.hash_one(&item), fingerprint_bits)`.
+///
+/// See [`truncate_to_fingerprint()`] for details on when truncation is needed.
+#[inline]
+pub fn compute_fingerprint_with_hasher<T: Hash, S: BuildHasher>(
+    build_hasher: &S,
+    item: T,
+    fingerprint_bits: u8,
+) -> u64 {
+    truncate_to_fingerprint(build_hasher.hash_one(&item), fingerprint_bits)
+}
+
+// Private convenience wrapper using the default hasher (test only).
+#[cfg(test)]
+#[inline]
+fn compute_fingerprint<T: Hash>(item: T, fingerprint_bits: u8) -> u64 {
+    compute_fingerprint_with_hasher(&StableBuildHasher, item, fingerprint_bits)
 }
 
 /// Specifications for a filter with given parameters.
@@ -132,7 +154,7 @@ pub struct FilterSpecs {
     /// Internal fingerprint size in bits.
     ///
     /// This is an implementation detail exposed for advanced use cases like
-    /// pre-computing fingerprints with [`compute_fingerprint()`]. It represents
+    /// pre-computing fingerprints with [`compute_fingerprint_with_hasher()`]. It represents
     /// the full hash width (qbits + rbits), not the storage cost per item.
     pub fingerprint_bits: u8,
 }
@@ -156,7 +178,7 @@ pub struct FilterSpecs {
 /// # Example
 ///
 /// ```rust
-/// use qfilter::{filter_specs, compute_fingerprint, Filter};
+/// use qfilter::{filter_specs, compute_fingerprint_with_hasher, StableBuildHasher, Filter};
 ///
 /// let capacity = 10000;
 /// let fp_rate = 0.01;
@@ -166,7 +188,7 @@ pub struct FilterSpecs {
 ///
 /// // Pre-compute fingerprints using the fingerprint size
 /// let fingerprints: Vec<u64> = (0..100)
-///     .map(|i| compute_fingerprint(i, specs.fingerprint_bits))
+///     .map(|i| compute_fingerprint_with_hasher(&StableBuildHasher, i, specs.fingerprint_bits))
 ///     .collect();
 ///
 /// // Memory will be between min and max depending on how the filter grows
@@ -266,13 +288,16 @@ fn calculate_needed_slots(desired: u64) -> Result<u64, Error> {
     serde(bound(serialize = "B: serde_bytes::Serialize"))
 )]
 #[cfg_attr(feature = "jsonschema", derive(JsonSchema))]
-pub struct Filter<B = Box<[u8]>> {
+pub struct Filter<B = Box<[u8]>, S = StableBuildHasher> {
     #[cfg_attr(
         feature = "serde",
         serde(rename = "b", serialize_with = "serde_bytes::serialize",)
     )]
     #[cfg_attr(feature = "jsonschema", schemars(with = "Vec<u8>"))]
     buffer: B,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "jsonschema", schemars(skip))]
+    build_hasher: S,
     #[cfg_attr(feature = "serde", serde(rename = "l"))]
     len: u64,
     #[cfg_attr(feature = "serde", serde(rename = "q"))]
@@ -302,12 +327,12 @@ struct FilterUnchecked<B> {
 
 #[cfg(feature = "serde")]
 impl<B: AsRef<[u8]>> FilterUnchecked<B> {
-    fn try_into_filter(self) -> Result<Filter<B>, &'static str> {
+    fn try_into_filter<S: Default>(self) -> Result<Filter<B, S>, &'static str> {
         let qbits = self.qbits.get();
         let rbits = self.rbits.get();
         // qbits must be at least 6 (64 slots per block), within MAX_QBITS,
         // and fingerprint must fit in 64 bits
-        if qbits < 6 || qbits > Filter::MAX_QBITS || qbits as u16 + rbits as u16 > 64 {
+        if !(6..=MAX_QBITS).contains(&qbits) || qbits as u16 + rbits as u16 > 64 {
             return Err("invalid qbits/rbits");
         }
         // buffer length must match the expected size for this qbits/rbits
@@ -324,12 +349,13 @@ impl<B: AsRef<[u8]>> FilterUnchecked<B> {
         // max_qbits must be >= qbits, <= MAX_QBITS, and within fingerprint bounds
         if let Some(max_qbits) = self.max_qbits {
             let mq = max_qbits.get();
-            if mq < qbits || mq > Filter::MAX_QBITS || mq as u16 > qbits as u16 + rbits as u16 - 1 {
+            if mq < qbits || mq > MAX_QBITS || mq as u16 > qbits as u16 + rbits as u16 - 1 {
                 return Err("invalid max_qbits");
             }
         }
         Ok(Filter {
             buffer: self.buffer,
+            build_hasher: S::default(),
             len: self.len,
             qbits: self.qbits,
             rbits: self.rbits,
@@ -339,8 +365,13 @@ impl<B: AsRef<[u8]>> FilterUnchecked<B> {
 }
 
 /// The `AsRef<[u8]>` bound is required to validate the buffer length during deserialization.
+///
+/// The hasher is not serialized — it is reconstructed via `S::default()` on deserialization.
+/// Use [`Filter::with_hasher()`] to set a specific hasher after deserialization.
 #[cfg(feature = "serde")]
-impl<'de, B: AsRef<[u8]> + serde_bytes::Deserialize<'de>> Deserialize<'de> for Filter<B> {
+impl<'de, B: AsRef<[u8]> + serde_bytes::Deserialize<'de>, S: Default> Deserialize<'de>
+    for Filter<B, S>
+{
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         FilterUnchecked::<B>::deserialize(deserializer)?
             .try_into_filter()
@@ -350,10 +381,10 @@ impl<'de, B: AsRef<[u8]> + serde_bytes::Deserialize<'de>> Deserialize<'de> for F
 
 /// A read-only, borrowed view of a [`Filter`].
 ///
-/// This is a type alias for `Filter<&[u8]>`. It supports all read-only operations
-/// ([`contains`](Filter::contains), [`count`](Filter::count),
-/// [`fingerprints`](Filter::fingerprints), etc.) and enables zero-copy deserialization
-/// from binary formats like CBOR, bincode, or postcard via serde.
+/// This is a type alias for `Filter<&[u8], S>` with `S` defaulting to [`StableBuildHasher`].
+/// It supports all read-only operations ([`contains`](Filter::contains),
+/// [`count`](Filter::count), [`fingerprints`](Filter::fingerprints), etc.) and enables
+/// zero-copy deserialization from binary formats like CBOR, bincode, or postcard via serde.
 ///
 /// # Zero-copy deserialization
 ///
@@ -364,9 +395,9 @@ impl<'de, B: AsRef<[u8]> + serde_bytes::Deserialize<'de>> Deserialize<'de> for F
 /// ```
 ///
 /// Use [`FilterRef::to_owned()`](Filter::to_owned) to convert to a [`Filter`] when mutation is needed.
-pub type FilterRef<'a> = Filter<&'a [u8]>;
+pub type FilterRef<'a, S = StableBuildHasher> = Filter<&'a [u8], S>;
 
-impl Copy for Filter<&[u8]> {}
+impl Copy for Filter<&[u8], StableBuildHasher> {}
 
 /// Errors returned by [`Filter`] operations.
 #[derive(Debug)]
@@ -566,10 +597,36 @@ impl CastNonZeroU8 for NonZeroU8 {
 
 // Read-only methods available on any Filter<B> where the buffer can be read as &[u8].
 // This covers both Filter (owned, B=Box<[u8]>) and FilterRef (borrowed, B=&[u8]).
-impl<B: AsRef<[u8]>> Filter<B> {
+impl<B: AsRef<[u8]>, S> Filter<B, S> {
+    /// Replaces the hasher, returning a filter with the new hasher type.
+    ///
+    /// This is a zero-cost operation — only the hasher is swapped, the stored
+    /// fingerprints are unchanged. Useful after deserialization to restore the
+    /// hasher that was used when the filter was originally populated.
+    ///
+    /// **Warning:** On a non-empty filter, `T: Hash` methods will only work
+    /// correctly if the new hasher produces the same hashes as the one used
+    /// at insertion time. The fingerprint-based API is unaffected.
+    ///
+    /// ```rust,ignore
+    /// // Deserialize, then restore the original hasher used at insertion time.
+    /// let f: Filter = serde_cbor::from_slice(&bytes)?;
+    /// let f = f.with_hasher(original_hasher);
+    /// ```
+    pub fn with_hasher<S2>(self, build_hasher: S2) -> Filter<B, S2> {
+        Filter {
+            buffer: self.buffer,
+            build_hasher,
+            len: self.len,
+            qbits: self.qbits,
+            rbits: self.rbits,
+            max_qbits: self.max_qbits,
+        }
+    }
+
     /// Returns the fingerprint size in bits.
     ///
-    /// Use this with [`compute_fingerprint()`] to create compatible fingerprints.
+    /// Use this with [`compute_fingerprint_with_hasher()`] to create compatible fingerprints.
     #[inline]
     pub fn fingerprint_size(&self) -> u8 {
         self.qbits.get() + self.rbits.get()
@@ -635,7 +692,10 @@ impl<B: AsRef<[u8]>> Filter<B> {
     /// Returns `true` if the item is probably in the filter, `false` if definitely not.
     ///
     /// May return false positives but never false negatives.
-    pub fn contains<T: Hash>(&self, item: T) -> bool {
+    pub fn contains<T: Hash>(&self, item: T) -> bool
+    where
+        S: BuildHasher,
+    {
         self.contains_fingerprint(self.hash_item(item))
     }
 
@@ -662,7 +722,10 @@ impl<B: AsRef<[u8]>> Filter<B> {
     /// Returns how many times the item appears in the filter (approximate).
     ///
     /// Only meaningful if duplicates were inserted via [`Filter::insert_duplicated()`].
-    pub fn count<T: Hash>(&self, item: T) -> u64 {
+    pub fn count<T: Hash>(&self, item: T) -> u64
+    where
+        S: BuildHasher,
+    {
         self.count_fingerprint(self.hash_item(item))
     }
 
@@ -694,17 +757,24 @@ impl<B: AsRef<[u8]>> Filter<B> {
     /// [`Self::fingerprint_size()`] bits set (upper bits are zero).
     ///
     /// This is useful for serialization, migrating data between filters, or
-    /// inspecting stored values. Use [`compute_fingerprint()`] to compute a
+    /// inspecting stored values. Use [`compute_fingerprint_with_hasher()`] to compute a
     /// fingerprint compatible with this filter's size.
     pub fn fingerprints(&self) -> FingerprintIter<'_> {
         FingerprintIter::new(self)
     }
 
-    /// Returns a borrowed [`FilterRef`] view of this filter.
+    /// Returns a borrowed, read-only view of this filter.
+    ///
+    /// When using a custom hasher, `S` must implement `Clone` so it can be
+    /// shared with the returned view.
     #[inline]
-    pub fn as_filter_ref(&self) -> FilterRef<'_> {
-        FilterRef {
+    pub fn as_filter_ref(&self) -> FilterRef<'_, S>
+    where
+        S: Clone,
+    {
+        Filter {
             buffer: self.buffer.as_ref(),
+            build_hasher: self.build_hasher.clone(),
             len: self.len,
             qbits: self.qbits,
             rbits: self.rbits,
@@ -903,8 +973,11 @@ impl<B: AsRef<[u8]>> Filter<B> {
     }
 
     #[inline]
-    fn hash_item<T: Hash>(&self, item: T) -> u64 {
-        hash_item(item)
+    fn hash_item<T: Hash>(&self, item: T) -> u64
+    where
+        S: BuildHasher,
+    {
+        self.build_hasher.hash_one(&item)
     }
 
     #[inline]
@@ -931,7 +1004,7 @@ impl<B: AsRef<[u8]>> Filter<B> {
     }
 }
 
-impl<B: AsRef<[u8]>> std::fmt::Debug for Filter<B> {
+impl<B: AsRef<[u8]>, S> std::fmt::Debug for Filter<B, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Filter")
             .field("buffer", &"[..]")
@@ -943,12 +1016,13 @@ impl<B: AsRef<[u8]>> std::fmt::Debug for Filter<B> {
     }
 }
 
-/// Converts a borrowed [`FilterRef`] into an owned [`Filter`].
-impl FilterRef<'_> {
-    /// Converts this borrowed filter view into an owned [`Filter`].
-    pub fn to_owned(&self) -> Filter {
+/// Converts a borrowed filter view into an owned [`Filter`].
+impl<S: Clone> Filter<&[u8], S> {
+    /// Converts this borrowed filter view into an owned filter.
+    pub fn to_owned(&self) -> Filter<Box<[u8]>, S> {
         Filter {
             buffer: self.buffer.into(),
+            build_hasher: self.build_hasher.clone(),
             len: self.len,
             qbits: self.qbits,
             rbits: self.rbits,
@@ -988,8 +1062,15 @@ pub struct FingerprintIter<'a> {
 }
 
 impl<'a> FingerprintIter<'a> {
-    fn new<B: AsRef<[u8]>>(filter: &'a Filter<B>) -> Self {
-        Self::from_ref(filter.as_filter_ref())
+    fn new<B: AsRef<[u8]>, S>(filter: &'a Filter<B, S>) -> Self {
+        Self::from_ref(FilterRef {
+            buffer: filter.buffer.as_ref(),
+            build_hasher: StableBuildHasher,
+            len: filter.len,
+            qbits: filter.qbits,
+            rbits: filter.rbits,
+            max_qbits: filter.max_qbits,
+        })
     }
 
     fn from_ref(filter: FilterRef<'a>) -> Self {
@@ -1096,21 +1177,24 @@ impl<'a> IntoIterator for &'a Filter {
 /// lookups, linear scans, and element shifting — reducing each insertion to a simple
 /// sequential write.
 ///
-/// The builder creates the filter internally and returns it via [`Self::into_filter()`]
-/// when done.
+/// Create a builder by passing an empty [`Filter`] to [`Builder::new()`], then
+/// call [`Self::into_filter()`] to retrieve the populated filter.
 ///
 /// # Example
 ///
 /// ```rust
-/// let mut inserter = qfilter::Builder::new(1000, 0.01).unwrap();
+/// let mut inserter = qfilter::Builder::new(qfilter::Filter::new(1000, 0.01).unwrap());
 /// let fp_size = inserter.fingerprint_size();
-/// let mut sorted_hashes: Vec<u64> = (0..100u64)
-///     .map(|i| qfilter::compute_fingerprint(i, fp_size))
-///     .collect();
-/// sorted_hashes.sort();
 ///
-/// for hash in sorted_hashes {
-///     inserter.insert_fingerprint(false, hash).unwrap();
+/// // Compute truncated fingerprints and sort them.
+/// // Builder requires fingerprints in non-decreasing order.
+/// let mut fps: Vec<u64> = (0..100u64)
+///     .map(|i| qfilter::compute_fingerprint_with_hasher(&qfilter::StableBuildHasher, i, fp_size))
+///     .collect();
+/// fps.sort();
+///
+/// for fp in fps {
+///     inserter.insert_fingerprint(false, fp).unwrap();
 /// }
 /// let filter = inserter.into_filter();
 ///
@@ -1119,65 +1203,30 @@ impl<'a> IntoIterator for &'a Filter {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Builder {
-    filter: Filter,
+pub struct Builder<S = StableBuildHasher> {
+    filter: Filter<Box<[u8]>, S>,
     next_slot: u64,
     last_quotient: u64,
     last_remainder: u64,
 }
 
-impl Builder {
-    /// Wraps an empty filter into a builder with zeroed tracking state.
-    fn new_empty(filter: Filter) -> Self {
-        debug_assert!(filter.is_empty());
+impl<S> Builder<S> {
+    /// Creates a builder from an empty filter.
+    ///
+    /// Use this with [`Filter::new_with_hasher()`] or other constructors to
+    /// build a filter with a custom hasher using sorted fingerprint insertion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the filter is not empty.
+    pub fn new(filter: Filter<Box<[u8]>, S>) -> Self {
+        assert!(filter.is_empty(), "Builder requires an empty filter");
         Self {
             filter,
             next_slot: 0,
             last_quotient: 0,
             last_remainder: 0,
         }
-    }
-
-    /// Creates a new builder with the given capacity and false positive rate.
-    ///
-    /// See [`Filter::new()`] for parameter details.
-    pub fn new(capacity: u64, fp_rate: f64) -> Result<Self, Error> {
-        Filter::new(capacity, fp_rate).map(Self::new_empty)
-    }
-
-    /// Creates a resizeable builder that can grow from `initial_capacity`
-    /// to `max_capacity`.
-    ///
-    /// See [`Filter::new_resizeable()`] for parameter details.
-    pub fn new_resizeable(
-        initial_capacity: u64,
-        max_capacity: u64,
-        fp_rate: f64,
-    ) -> Result<Self, Error> {
-        Filter::new_resizeable(initial_capacity, max_capacity, fp_rate).map(Self::new_empty)
-    }
-
-    /// Creates a builder with a specific fingerprint bit size.
-    ///
-    /// Use this when storing pre-computed fingerprints via [`Self::insert_fingerprint()`].
-    ///
-    /// See [`Filter::with_fingerprint_size()`] for parameter details.
-    pub fn with_fingerprint_size(
-        initial_capacity: u64,
-        fingerprint_bits: u8,
-    ) -> Result<Self, Error> {
-        Filter::with_fingerprint_size(initial_capacity, fingerprint_bits).map(Self::new_empty)
-    }
-
-    /// Creates a builder for internal rebuild paths (grow, shrink).
-    fn with_qr(
-        qbits: NonZeroU8,
-        rbits: NonZeroU8,
-        max_qbits: Option<NonZeroU8>,
-    ) -> Result<Self, Error> {
-        let mut filter = Filter::with_qr(qbits, rbits)?;
-        filter.max_qbits = max_qbits;
-        Ok(Self::new_empty(filter))
     }
 
     /// Returns the fingerprint size (in bits) of the filter being built.
@@ -1191,8 +1240,22 @@ impl Builder {
     }
 
     /// Consumes the builder and returns the constructed filter.
-    pub fn into_filter(self) -> Filter {
+    pub fn into_filter(self) -> Filter<Box<[u8]>, S> {
         self.filter
+    }
+}
+
+impl<S: Clone> Builder<S> {
+    /// Creates a builder for internal rebuild paths (grow, shrink).
+    fn with_qr_and_hasher(
+        qbits: NonZeroU8,
+        rbits: NonZeroU8,
+        max_qbits: Option<NonZeroU8>,
+        build_hasher: S,
+    ) -> Result<Self, Error> {
+        let mut filter = Filter::with_qr_and_hasher(qbits, rbits, build_hasher)?;
+        filter.max_qbits = max_qbits;
+        Ok(Self::new(filter))
     }
 
     /// Inserts a fingerprint that must be >= all previously inserted fingerprints.
@@ -1290,14 +1353,19 @@ impl Builder {
     }
 }
 
-impl Filter {
-    /// Maximum log2 number of slots that can be used in the filter.
-    /// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
-    const MAX_QBITS: u8 = 59;
+/// Maximum log2 number of slots that can be used in the filter.
+/// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
+const MAX_QBITS: u8 = 59;
 
+impl<B, S> Filter<B, S> {
     /// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
-    pub const MAX_CAPACITY: u64 = (2u64.pow(Self::MAX_QBITS as u32) * 19).div_ceil(20);
+    pub const MAX_CAPACITY: u64 = crate::MAX_CAPACITY;
+}
 
+/// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
+const MAX_CAPACITY: u64 = (2u64.pow(MAX_QBITS as u32) * 19).div_ceil(20);
+
+impl Filter {
     /// Creates a new filter with the given capacity and false positive rate.
     ///
     /// # Parameters
@@ -1353,7 +1421,7 @@ impl Filter {
     /// Creates a new resizeable filter with a specific fingerprint bit size.
     ///
     /// Use this when storing pre-computed fingerprints via [`Self::insert_fingerprint()`].
-    /// Use [`compute_fingerprint()`] to compute fingerprints with a specific bit size.
+    /// Use [`compute_fingerprint_with_hasher()`] to compute fingerprints with a specific bit size.
     ///
     /// # Parameters
     ///
@@ -1367,7 +1435,7 @@ impl Filter {
     pub fn with_fingerprint_size(
         initial_capacity: u64,
         fingerprint_bits: u8,
-    ) -> Result<Filter, Error> {
+    ) -> Result<Self, Error> {
         if !(7..=64).contains(&fingerprint_bits) {
             return Err(Error::NotEnoughFingerprintBits);
         }
@@ -1379,26 +1447,13 @@ impl Filter {
         let rbits = fingerprint_bits - qbits;
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
         if rbits > 1 {
-            result.max_qbits = Some((qbits + rbits - 1).min(Self::MAX_QBITS).try_into().unwrap());
+            result.max_qbits = Some((qbits + rbits - 1).min(MAX_QBITS).try_into().unwrap());
         }
         Ok(result)
     }
 
-    fn with_qr(qbits: NonZeroU8, rbits: NonZeroU8) -> Result<Filter, Error> {
-        Self::check_cpu_support();
-        if qbits.get() + rbits.get() > 64 {
-            return Err(Error::NotEnoughFingerprintBits);
-        }
-        let buffer_bytes = usize::try_from(calculate_memory_bytes(qbits.get(), rbits.get()))
-            .map_err(|_| Error::CapacityTooLarge)?;
-        let buffer = vec![0u8; buffer_bytes].into_boxed_slice();
-        Ok(Self {
-            buffer,
-            qbits,
-            rbits,
-            len: 0,
-            max_qbits: None,
-        })
+    fn with_qr(qbits: NonZeroU8, rbits: NonZeroU8) -> Result<Self, Error> {
+        Self::with_qr_and_hasher(qbits, rbits, StableBuildHasher)
     }
 
     fn check_cpu_support() {
@@ -1420,6 +1475,100 @@ impl Filter {
             std::is_x86_feature_detected!("bmi2"),
             "CPU doesn't support the bmi2 instructions"
         );
+    }
+}
+
+impl<S> Filter<Box<[u8]>, S> {
+    fn with_qr_and_hasher(
+        qbits: NonZeroU8,
+        rbits: NonZeroU8,
+        build_hasher: S,
+    ) -> Result<Self, Error> {
+        Filter::check_cpu_support();
+        if qbits.get() + rbits.get() > 64 {
+            return Err(Error::NotEnoughFingerprintBits);
+        }
+        let buffer_bytes = usize::try_from(calculate_memory_bytes(qbits.get(), rbits.get()))
+            .map_err(|_| Error::CapacityTooLarge)?;
+        let buffer = vec![0u8; buffer_bytes].into_boxed_slice();
+        Ok(Self {
+            buffer,
+            build_hasher,
+            qbits,
+            rbits,
+            len: 0,
+            max_qbits: None,
+        })
+    }
+}
+
+impl<S: Clone> Filter<Box<[u8]>, S> {
+    /// Creates a new filter with the given capacity, false positive rate, and custom hasher.
+    ///
+    /// The same hasher (and seed) must be used for all operations on this filter.
+    /// The hasher is not serialized. On deserialization it is reconstructed via
+    /// `S::default()`. If that doesn't produce the correct hasher, use
+    /// [`Filter::with_hasher()`] to restore it.
+    ///
+    /// See [`Filter::new()`] for parameter details.
+    #[inline]
+    pub fn new_with_hasher(capacity: u64, fp_rate: f64, build_hasher: S) -> Result<Self, Error> {
+        Self::new_resizeable_with_hasher(capacity, capacity, fp_rate, build_hasher)
+    }
+
+    /// Creates a resizeable filter with a custom hasher.
+    ///
+    /// See [`Filter::new_resizeable()`] and [`Filter::new_with_hasher()`] for details.
+    pub fn new_resizeable_with_hasher(
+        initial_capacity: u64,
+        max_capacity: u64,
+        fp_rate: f64,
+        build_hasher: S,
+    ) -> Result<Self, Error> {
+        assert!(max_capacity >= initial_capacity);
+        let slots_for_capacity = calculate_needed_slots(initial_capacity)?;
+        let qbits = slots_for_capacity.trailing_zeros() as u8;
+        let slots_for_max_capacity = calculate_needed_slots(max_capacity)?;
+        let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
+        let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
+        let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8 + (max_qbits - qbits);
+        let mut result = Self::with_qr_and_hasher(
+            qbits.try_into().unwrap(),
+            rbits.try_into().unwrap(),
+            build_hasher,
+        )?;
+        if max_qbits > qbits {
+            result.max_qbits = Some(max_qbits.try_into().unwrap());
+        }
+        Ok(result)
+    }
+
+    /// Creates a filter with a specific fingerprint bit size and custom hasher.
+    ///
+    /// See [`Filter::with_fingerprint_size()`] and [`Filter::new_with_hasher()`] for details.
+    pub fn with_fingerprint_size_and_hasher(
+        initial_capacity: u64,
+        fingerprint_bits: u8,
+        build_hasher: S,
+    ) -> Result<Self, Error> {
+        if !(7..=64).contains(&fingerprint_bits) {
+            return Err(Error::NotEnoughFingerprintBits);
+        }
+        let slots_for_capacity = calculate_needed_slots(initial_capacity)?;
+        let qbits = slots_for_capacity.trailing_zeros() as u8;
+        if fingerprint_bits <= qbits {
+            return Err(Error::NotEnoughFingerprintBits);
+        }
+        let rbits = fingerprint_bits - qbits;
+        let mut result = Self::with_qr_and_hasher(
+            qbits.try_into().unwrap(),
+            rbits.try_into().unwrap(),
+            build_hasher,
+        )?;
+        if rbits > 1 {
+            result.max_qbits = Some((qbits + rbits - 1).min(MAX_QBITS).try_into().unwrap());
+        }
+        Ok(result)
     }
 
     /// Removes all items from the filter.
@@ -1721,7 +1870,10 @@ impl Filter {
     ///
     /// **Warning:** Removing an item that wasn't inserted may cause false negatives
     /// for other items with colliding fingerprints.
-    pub fn remove<T: Hash>(&mut self, item: T) -> bool {
+    pub fn remove<T: Hash>(&mut self, item: T) -> bool
+    where
+        S: BuildHasher,
+    {
         self.remove_fingerprint(self.hash_item(item))
     }
 
@@ -1799,7 +1951,10 @@ impl Filter {
     ///
     /// Returns [`Error::CapacityExceeded`] if the filter is full.
     #[inline]
-    pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error> {
+    pub fn insert_duplicated<T: Hash>(&mut self, item: T) -> Result<(), Error>
+    where
+        S: BuildHasher,
+    {
         self.insert_counting(u64::MAX, item).map(|_| ())
     }
 
@@ -1811,7 +1966,10 @@ impl Filter {
     /// - `Ok(false)` if already present (may be a false positive).
     /// - `Err(Error::CapacityExceeded)` if the filter is full.
     #[inline]
-    pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error> {
+    pub fn insert<T: Hash>(&mut self, item: T) -> Result<bool, Error>
+    where
+        S: BuildHasher,
+    {
         self.insert_counting(1, item).map(|count| count == 0)
     }
 
@@ -1822,7 +1980,10 @@ impl Filter {
     /// - `Ok(prev_count)` where `prev_count` is how many times the item was already present.
     ///   A new copy is inserted only if `prev_count < max_count`.
     /// - `Err(Error::CapacityExceeded)` if the filter is full.
-    pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error> {
+    pub fn insert_counting<T: Hash>(&mut self, max_count: u64, item: T) -> Result<u64, Error>
+    where
+        S: BuildHasher,
+    {
         let hash = self.hash_item(item);
         match self.insert_impl(max_count, hash) {
             Ok(count) => Ok(count),
@@ -1837,7 +1998,7 @@ impl Filter {
     ///
     /// Use this instead of [`Self::insert()`] when you have pre-computed fingerprints,
     /// are migrating data between filters, or need deterministic behavior with specific
-    /// hash values. Use [`compute_fingerprint()`] to compute compatible fingerprints.
+    /// hash values. Use [`compute_fingerprint_with_hasher()`] to compute compatible fingerprints.
     ///
     /// # Parameters
     ///
@@ -1994,10 +2155,11 @@ impl Filter {
     /// ```
     pub fn shrink_to_fit(&mut self) {
         if self.total_blocks().get() > 1 && self.len() <= self.capacity() / 2 {
-            let mut inserter = Builder::with_qr(
+            let mut inserter = Builder::with_qr_and_hasher(
                 (self.qbits.get() - 1).try_into().unwrap(),
                 (self.rbits.get() + 1).try_into().unwrap(),
                 self.max_qbits,
+                self.build_hasher.clone(),
             )
             .unwrap();
             // Use insert_impl directly: the shrunk filter has capacity >= len (50% occupancy).
@@ -2014,6 +2176,9 @@ impl Filter {
     }
 
     /// Merges all fingerprints from `other` into `self`.
+    ///
+    /// Both filters must have been built with the same hasher (and seed) for the
+    /// result to be meaningful when using `T: Hash` methods.
     ///
     /// # Parameters
     ///
@@ -2051,10 +2216,10 @@ impl Filter {
     ///     assert!(filter1.contains(i));
     /// }
     /// ```
-    pub fn merge(
+    pub fn merge<B2: AsRef<[u8]>, S2>(
         &mut self,
         keep_duplicates: bool,
-        other: &Filter<impl AsRef<[u8]>>,
+        other: &Filter<B2, S2>,
     ) -> Result<(), Error> {
         if self.fingerprint_size() == other.fingerprint_size() {
             *self = self.merge_sorted(keep_duplicates, other)?;
@@ -2075,11 +2240,11 @@ impl Filter {
     ///
     /// Both iterators yield fingerprints in the same sorted order because
     /// the filters have identical fingerprint sizes (same qbits/rbits split).
-    fn merge_sorted(
+    fn merge_sorted<B2: AsRef<[u8]>, S2>(
         &self,
         keep_duplicates: bool,
-        other: &Filter<impl AsRef<[u8]>>,
-    ) -> Result<Filter, Error> {
+        other: &Filter<B2, S2>,
+    ) -> Result<Self, Error> {
         debug_assert_eq!(self.fingerprint_size(), other.fingerprint_size());
         // Preserve growth headroom from self.
         // Pre-size to avoid intermediate growths, capped by self's max_qbits.
@@ -2099,10 +2264,11 @@ impl Filter {
         }
         let qbits = self.qbits.get().max(needed_qbits);
         let rbits = self.fingerprint_size() - qbits;
-        let mut builder = Builder::with_qr(
+        let mut builder = Builder::with_qr_and_hasher(
             NonZeroU8::new(qbits).unwrap(),
             NonZeroU8::new(rbits).unwrap(),
             self.max_qbits,
+            self.build_hasher.clone(),
         )?;
         let mut a = self.fingerprints().peekable();
         let mut b = other.fingerprints().peekable();
@@ -2133,14 +2299,15 @@ impl Filter {
     /// Returns a builder (not a filter) so that callers can either continue
     /// the fast sequential-append path or consume it via [`Builder::into_filter()`].
     #[cold]
-    fn rebuild_grown(&self) -> Result<Builder, Error> {
+    fn rebuild_grown(&self) -> Result<Builder<S>, Error> {
         let max = self.max_qbits.ok_or(Error::CapacityExceeded)?;
         if max <= self.qbits {
             return Err(Error::CapacityExceeded);
         }
         let qbits = self.qbits.checked_add(1).ok_or(Error::CapacityExceeded)?;
         let rbits = NonZeroU8::new(self.rbits.get() - 1).ok_or(Error::CapacityExceeded)?;
-        let mut inserter = Builder::with_qr(qbits, rbits, self.max_qbits)?;
+        let mut inserter =
+            Builder::with_qr_and_hasher(qbits, rbits, self.max_qbits, self.build_hasher.clone())?;
         // Use insert_impl directly: the new filter has 2x capacity so growth cannot happen.
         for hash in self.fingerprints() {
             inserter
@@ -2533,8 +2700,12 @@ mod tests {
             for i in 0..f.capacity() {
                 assert!(f.contains(i));
             }
-            let est_fp_rate =
-                (0..).take(50_000).filter(|i| f.contains(i)).count() as f64 / 50_000.0;
+            let fp_test_start = f.capacity();
+            let est_fp_rate = (fp_test_start..)
+                .take(50_000)
+                .filter(|i| f.contains(i))
+                .count() as f64
+                / 50_000.0;
             dbg!(f.max_error_ratio(), est_fp_rate);
             assert!(est_fp_rate <= f.max_error_ratio());
         }
@@ -2879,7 +3050,7 @@ mod tests {
 
     #[test]
     fn test_dec_offset_edge_case() {
-        // case found in fuzz testing
+        // case found in fuzz testing, exercises offset decrement across blocks
         #[rustfmt::skip]
         let sample = [(0u16, 287), (2u16, 1), (9u16, 2), (10u16, 1), (53u16, 5), (61u16, 5), (127u16, 2), (232u16, 1), (255u16, 21), (314u16, 2), (317u16, 2), (384u16, 2), (511u16, 3), (512u16, 2), (1599u16, 2), (2303u16, 5), (2559u16, 2), (2568u16, 3), (2815u16, 2), (6400u16, 2), (9211u16, 2), (9728u16, 2), (10790u16, 1), (10794u16, 94), (10797u16, 2), (10999u16, 2), (11007u16, 2), (11520u16, 1), (12800u16, 4), (12842u16, 2), (13823u16, 1), (14984u16, 2), (15617u16, 2), (15871u16, 4), (16128u16, 3), (16383u16, 2), (16394u16, 1), (18167u16, 2), (23807u16, 1), (32759u16, 2)];
         let template = Filter::new(400, 0.1).unwrap();
@@ -2890,19 +3061,21 @@ mod tests {
                 f.insert_duplicated(i).unwrap();
             }
         }
-        assert_eq!(f.raw_block(2).offset, 3);
-        assert_eq!(f.raw_block(3).offset, u8::MAX as u64);
         f.validate_offsets(0, f.total_buckets().get());
         f.remove(0u16);
-        assert_eq!(f.raw_block(2).offset, 2);
-        assert_eq!(f.raw_block(3).offset, 254);
         f.validate_offsets(0, f.total_buckets().get());
     }
 
     #[test]
     fn test_capacity_edge_cases() {
-        for n in 1..32 {
-            let base = (1 << n) * 19 / 20;
+        // Cap at 28 to avoid buffer allocation overflow on 32-bit platforms
+        let max_n = if cfg!(target_pointer_width = "32") {
+            28
+        } else {
+            32
+        };
+        for n in 1..max_n {
+            let base = (1u64 << n) * 19 / 20;
             // Test numbers around the edge
             for i in [base - 1, base, base + 1] {
                 let filter = Filter::new(i, 0.01).unwrap();
@@ -2924,20 +3097,20 @@ mod tests {
             assert!(f.capacity() <= f.max_capacity());
             assert_eq!(
                 f.max_capacity(),
-                ((1u64 << (i - 1).min(Filter::MAX_QBITS)) * 19).div_ceil(20)
+                ((1u64 << (i - 1).min(MAX_QBITS)) * 19).div_ceil(20)
             );
         }
-        for i in 1..Filter::MAX_QBITS {
+        for i in 1..MAX_QBITS {
             let f = Filter::new_resizeable(0, 2u64.pow(i as u32), 0.5).unwrap();
             assert_eq!(f.capacity(), 61);
             assert!(f.capacity() <= f.max_capacity());
         }
         // Test the maximum capacity
-        let f = Filter::new_resizeable(0, Filter::MAX_CAPACITY, 0.5).unwrap();
+        let f = Filter::new_resizeable(0, MAX_CAPACITY, 0.5).unwrap();
         assert_eq!(f.capacity(), 61);
-        assert_eq!(f.max_capacity(), Filter::MAX_CAPACITY);
+        assert_eq!(f.max_capacity(), MAX_CAPACITY);
         // Test the maximum capacity + 1, which should fail
-        Filter::new_resizeable(0, Filter::MAX_CAPACITY + 1, 0.5).unwrap_err();
+        Filter::new_resizeable(0, MAX_CAPACITY + 1, 0.5).unwrap_err();
     }
 
     #[test]
@@ -2954,7 +3127,7 @@ mod tests {
                     regular.insert_fingerprint(true, h).unwrap();
                 }
 
-                let mut inserter = Builder::new(cap, fp_rate).unwrap();
+                let mut inserter = Builder::new(Filter::new(cap, fp_rate).unwrap());
                 for &h in &fingerprints {
                     inserter.insert_fingerprint(true, h).unwrap();
                 }
@@ -2970,7 +3143,7 @@ mod tests {
 
     #[test]
     fn test_builder_no_duplicates() {
-        let mut inserter = Builder::new(1000, 0.01).unwrap();
+        let mut inserter = Builder::new(Filter::new(1000, 0.01).unwrap());
         let fp_size = inserter.fingerprint_size();
         let mut fingerprints: Vec<u64> = (0..500u64)
             .map(|i| compute_fingerprint(i, fp_size))
@@ -2992,7 +3165,7 @@ mod tests {
 
     #[test]
     fn test_builder_with_duplicates() {
-        let mut inserter = Builder::new(1000, 0.01).unwrap();
+        let mut inserter = Builder::new(Filter::new(1000, 0.01).unwrap());
         let fp_size = inserter.fingerprint_size();
 
         // Insert the same fingerprint multiple times
@@ -3008,7 +3181,7 @@ mod tests {
 
     #[test]
     fn test_builder_auto_growth() {
-        let mut inserter = Builder::new_resizeable(100, 5000, 0.01).unwrap();
+        let mut inserter = Builder::new(Filter::new_resizeable(100, 5000, 0.01).unwrap());
         let initial_cap = inserter.capacity();
         let fp_size = inserter.fingerprint_size();
 
@@ -3032,7 +3205,7 @@ mod tests {
 
     #[test]
     fn test_builder_empty_filter() {
-        let inserter = Builder::new(100, 0.01).unwrap();
+        let inserter = Builder::new(Filter::new(100, 0.01).unwrap());
         let f = inserter.into_filter();
         assert!(f.is_empty());
     }
@@ -3040,7 +3213,7 @@ mod tests {
     #[test]
     fn test_builder_various_fingerprint_sizes() {
         for fp_size in [14, 16, 20, 24, 32] {
-            let mut inserter = Builder::with_fingerprint_size(500, fp_size).unwrap();
+            let mut inserter = Builder::new(Filter::with_fingerprint_size(500, fp_size).unwrap());
             let cap = inserter.capacity();
             let mut fingerprints: Vec<u64> =
                 (0..cap).map(|i| compute_fingerprint(i, fp_size)).collect();
@@ -3065,7 +3238,7 @@ mod tests {
     #[test]
     fn test_builder_single_block() {
         // Small filter that fits in a single block (64 slots)
-        let mut inserter = Builder::new(50, 0.01).unwrap();
+        let mut inserter = Builder::new(Filter::new(50, 0.01).unwrap());
         let fp_size = inserter.fingerprint_size();
         let cap = inserter.capacity();
         let mut fingerprints: Vec<u64> =
@@ -3086,7 +3259,7 @@ mod tests {
     #[test]
     fn test_builder_multi_block_spillover() {
         // Use a filter with multiple blocks and a small fingerprint size to force spillover
-        let mut inserter = Builder::with_fingerprint_size(500, 14).unwrap();
+        let mut inserter = Builder::new(Filter::with_fingerprint_size(500, 14).unwrap());
         let cap = inserter.capacity();
         let fp_size = inserter.fingerprint_size();
         let mask = (1u64 << fp_size) - 1;
@@ -3118,7 +3291,7 @@ mod tests {
         // compared to regular insertion, including at high occupancy where
         // the wrapping slow path is triggered.
         for (cap, fp_rate) in [(500, 0.001), (100, 0.01), (1000, 0.0001)] {
-            let mut inserter = Builder::new(cap, fp_rate).unwrap();
+            let mut inserter = Builder::new(Filter::new(cap, fp_rate).unwrap());
             let fp_size = inserter.fingerprint_size();
             let capacity = inserter.capacity();
 
@@ -3161,7 +3334,7 @@ mod tests {
         }
 
         // Sorted insertion
-        let mut inserter = Builder::with_fingerprint_size(cap, fp_size).unwrap();
+        let mut inserter = Builder::new(Filter::with_fingerprint_size(cap, fp_size).unwrap());
         for &h in &fingerprints {
             let _ = inserter.insert_fingerprint(false, h);
         }
@@ -3171,5 +3344,117 @@ mod tests {
         let reg_fps: Vec<u64> = regular.fingerprints().collect();
         let sort_fps: Vec<u64> = sorted_f.fingerprints().collect();
         assert_eq!(reg_fps, sort_fps);
+    }
+
+    #[test]
+    fn test_custom_hasher() {
+        use std::collections::hash_map::RandomState;
+
+        let hasher = RandomState::new();
+        let mut f = Filter::new_with_hasher(1000, 0.01, hasher).unwrap();
+        for i in 0u64..100 {
+            f.insert(i).unwrap();
+        }
+        for i in 0u64..100 {
+            assert!(f.contains(i));
+        }
+        // Remove and verify
+        assert!(f.remove(50u64));
+        assert!(!f.contains(50u64));
+    }
+
+    #[test]
+    fn test_random_build_hasher() {
+        let hasher = foldhash_portable::quality::RandomState::default();
+        let mut f = Filter::new_with_hasher(1000, 0.01, hasher).unwrap();
+        for i in 0u64..100 {
+            f.insert(i).unwrap();
+        }
+        for i in 0u64..100 {
+            assert!(f.contains(i));
+        }
+    }
+
+    #[test]
+    fn test_stable_build_hasher_deterministic() {
+        // Two filters with the default StableBuildHasher produce identical fingerprints
+        let mut f1 = Filter::new(1000, 0.01).unwrap();
+        let mut f2 = Filter::new(1000, 0.01).unwrap();
+        for i in 0u64..100 {
+            f1.insert(i).unwrap();
+            f2.insert(i).unwrap();
+        }
+        let fps1: Vec<u64> = f1.fingerprints().collect();
+        let fps2: Vec<u64> = f2.fingerprints().collect();
+        assert_eq!(fps1, fps2);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_hash_stability() {
+        // Build filters with known inputs and verify serialized bytes match
+        // hardcoded values. This catches any change in the hash algorithm or
+        // StableHasher normalization, and ensures cross-platform compatibility
+        // (the same bytes must be produced on 32-bit BE and 64-bit LE).
+
+        fn build_filter(items: &[usize], capacity: u64, fp_rate: f64) -> Vec<u8> {
+            let mut f = Filter::new(capacity, fp_rate).unwrap();
+            for &i in items {
+                f.insert(i).unwrap();
+            }
+            serde_cbor::to_vec(&f).unwrap()
+        }
+
+        // Small filter with a few usize items (exercises write_usize → write_u64 normalization)
+        let small = build_filter(&[1, 2, 3, 42, 100], 100, 0.01);
+        // Larger filter with sequential usize items
+        let seq = build_filter(&(0..50).collect::<Vec<_>>(), 100, 0.01);
+        // Filter with string items
+        let mut f = Filter::new(100, 0.01).unwrap();
+        for s in ["hello", "world", "foo", "bar"] {
+            f.insert(s).unwrap();
+        }
+        let strings = serde_cbor::to_vec(&f).unwrap();
+
+        // Hardcoded expected bytes — if these change, the hash algorithm or
+        // StableHasher normalization changed, breaking cross-platform compatibility.
+        // usize items exercise write_usize → write_u64 normalization (32-bit vs 64-bit).
+        assert_eq!(
+            small,
+            [
+                165, 97, 98, 88, 154, 0, 0, 17, 0, 136, 0, 0, 0, 0, 0, 17, 0, 136, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 93, 0, 0, 160, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 224, 14, 0, 0,
+                158, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                97, 108, 5, 97, 113, 7, 97, 114, 7, 97, 109, 246
+            ]
+        );
+        assert_eq!(
+            seq,
+            [
+                165, 97, 98, 88, 154, 0, 6, 249, 12, 228, 11, 2, 36, 134, 6, 121, 13, 228, 11, 2,
+                68, 134, 0, 203, 30, 0, 0, 0, 0, 93, 0, 32, 162, 45, 167, 48, 91, 0, 189, 11, 0, 0,
+                0, 0, 192, 5, 0, 184, 14, 159, 164, 22, 224, 2, 0, 0, 0, 128, 35, 0, 0, 0, 0, 0, 0,
+                128, 0, 0, 184, 113, 1, 0, 11, 22, 0, 0, 0, 226, 0, 14, 74, 209, 193, 40, 72, 117,
+                144, 14, 74, 145, 195, 40, 72, 117, 144, 128, 110, 44, 15, 0, 0, 0, 0, 40, 224, 7,
+                0, 132, 1, 32, 0, 0, 0, 6, 220, 242, 126, 42, 0, 0, 0, 140, 1, 0, 0, 160, 11, 120,
+                1, 0, 0, 0, 0, 2, 0, 4, 1, 59, 128, 21, 224, 137, 121, 0, 0, 0, 0, 80, 6, 0, 120,
+                0, 0, 0, 0, 0, 0, 0, 0, 97, 108, 24, 50, 97, 113, 7, 97, 114, 7, 97, 109, 246
+            ]
+        );
+        assert_eq!(
+            strings,
+            [
+                165, 97, 98, 88, 154, 0, 32, 0, 0, 0, 0, 8, 0, 32, 32, 0, 0, 0, 0, 8, 0, 32, 0, 0,
+                0, 0, 72, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 160, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 216, 0,
+                0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                64, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                97, 108, 4, 97, 113, 7, 97, 114, 7, 97, 109, 246
+            ]
+        );
     }
 }

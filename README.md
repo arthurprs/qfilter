@@ -42,7 +42,9 @@ for i in 0..1000 {
 
 ### Hasher
 
-The hashing algorithm used is [xxhash3](https://crates.io/crates/xxhash-rust) which offers both high performance and stability across platforms.
+Methods accepting `T: Hash` are provided for convenience using [foldhash-portable](https://crates.io/crates/foldhash-portable), which offers high performance and stability across platforms. Note that a fixed seed is used (no DoS resistance) and `#[derive(Hash)]` output is [not guaranteed stable](https://github.com/hoxxep/portable-hash#whats-wrong-with-the-stdhash-traits) across Rust compiler versions.
+
+`Filter` supports a custom `BuildHasher` via its `S` type parameter (similar to `HashMap`). Use `Filter::new_with_hasher()` and related constructors. The hasher is not serialized; on deserialization it is reconstructed via `S::default()`. If that doesn't produce the correct hasher, use `Filter::with_hasher()` to restore it. Filters being merged must use the same hasher.
 
 ### Filter size
 

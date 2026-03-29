@@ -45,14 +45,15 @@ fuzz_target!(|input: Input| {
     let Ok(mut regular) = regular_filter else {
         return;
     };
-    let builder = if resizable {
-        qfilter::Builder::new_resizeable(cap as u64, max_cap, 0.01)
+    let builder_filter = if resizable {
+        qfilter::Filter::new_resizeable(cap as u64, max_cap, 0.01)
     } else {
-        qfilter::Builder::with_fingerprint_size(cap as u64, fp_size)
+        qfilter::Filter::with_fingerprint_size(cap as u64, fp_size)
     };
-    let Ok(mut inserter) = builder else {
+    let Ok(builder_filter) = builder_filter else {
         return;
     };
+    let mut inserter = qfilter::Builder::new(builder_filter);
 
     // Use the actual fingerprint size from the constructed filter
     let actual_fp_size = regular.fingerprint_size();
