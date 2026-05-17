@@ -908,14 +908,48 @@ impl<B: AsRef<[u8]>, S> Filter<B, S> {
     }
 
     #[cold]
-    #[inline(never)]
     fn calc_offset(&self, block_num: u64) -> u64 {
-        let block_start = (block_num * 64) % self.total_buckets();
-        let mut run_start = self.run_start(block_start);
-        if run_start < block_start {
-            run_start += self.total_buckets().get();
+        let total_buckets = self.total_buckets();
+        let total_blocks = self.total_blocks();
+        let block_num = block_num % total_blocks;
+
+        // Compute offset for a block given run_start of its first bucket.
+        let offset_from_run_start = |block: u64, mut run_start: u64| -> u64 {
+            let block_start = (block * 64) % total_buckets;
+            if run_start < block_start {
+                run_start += total_buckets.get();
+            }
+            run_start - block_start
+        };
+
+        // Walk backwards to find a block whose previous block has a cached offset.
+        let mut cur_block = block_num;
+        loop {
+            let prev_block = (cur_block + total_blocks.get() - 1) % total_blocks;
+            if self.raw_block(prev_block).offset < u8::MAX as u64 {
+                break;
+            }
+            cur_block = prev_block;
+            debug_assert!(cur_block != block_num, "all blocks have overflowed offsets");
         }
-        run_start - block_start
+
+        // Bootstrap: compute offset for cur_block via run_start/run_end.
+        // Safe: the previous block has a cached offset, so run_end won't recurse.
+        let block_start = (cur_block * 64) % total_buckets;
+        let mut offset = offset_from_run_start(cur_block, self.run_start(block_start));
+
+        // Walk forward, computing each block's offset using run_end_with_offset
+        // to avoid recursion through blocks with overflowed cached offsets.
+        while cur_block != block_num {
+            let next_block = (cur_block + 1) % total_blocks;
+            let last_bucket = (cur_block * 64 + 63) % total_buckets;
+            let block = self.raw_block(cur_block);
+            let run_end = self.run_end_with_offset(last_bucket, cur_block, &block, offset);
+            offset = offset_from_run_start(next_block, (run_end + 1) % total_buckets);
+            cur_block = next_block;
+        }
+
+        offset
     }
 
     #[inline]
@@ -934,7 +968,6 @@ impl<B: AsRef<[u8]>, S> Filter<B, S> {
     fn run_end(&self, hash_bucket_idx: u64) -> u64 {
         let hash_bucket_idx = hash_bucket_idx % self.total_buckets();
         let bucket_block_idx = hash_bucket_idx / 64;
-        let bucket_intrablock_offset = hash_bucket_idx % 64;
         let bucket_block = self.raw_block(bucket_block_idx);
 
         let offset = if bucket_block.offset >= u8::MAX as u64 {
@@ -942,6 +975,18 @@ impl<B: AsRef<[u8]>, S> Filter<B, S> {
         } else {
             bucket_block.offset
         };
+        self.run_end_with_offset(hash_bucket_idx, bucket_block_idx, &bucket_block, offset)
+    }
+
+    #[inline(always)]
+    fn run_end_with_offset(
+        &self,
+        hash_bucket_idx: u64,
+        bucket_block_idx: u64,
+        bucket_block: &Block,
+        offset: u64,
+    ) -> u64 {
+        let bucket_intrablock_offset = hash_bucket_idx % 64;
         let bucket_intrablock_rank = bucket_block.occupieds.popcnt(..=bucket_intrablock_offset);
 
         if bucket_intrablock_rank == 0 {
