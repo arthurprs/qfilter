@@ -199,7 +199,7 @@ pub struct FilterSpecs {
 pub fn filter_specs(capacity: u64, fp_rate: f64) -> Result<FilterSpecs, Error> {
     let slots = calculate_needed_slots(capacity)?;
     let qbits = slots.trailing_zeros() as u8;
-    let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
+    let fp_rate = fp_rate.clamp(MIN_FP_RATE, 0.5);
     let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8;
     let fingerprint_bits = qbits + rbits;
     if fingerprint_bits > 64 {
@@ -1402,6 +1402,11 @@ impl<S: Clone> Builder<S> {
 /// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
 const MAX_QBITS: u8 = 59;
 
+/// Smallest representable false positive rate (2^-64). A lower rate would imply more
+/// than 64 fingerprint bits, which can't be addressed and would overflow the `u8` bit
+/// counts; such requests return [`Error::NotEnoughFingerprintBits`] instead of panicking.
+const MIN_FP_RATE: f64 = 1.0 / (1u64 << 63) as f64 / 2.0;
+
 impl<B, S> Filter<B, S> {
     /// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
     pub const MAX_CAPACITY: u64 = crate::MAX_CAPACITY;
@@ -1454,7 +1459,7 @@ impl Filter {
         let qbits = slots_for_capacity.trailing_zeros() as u8;
         let slots_for_max_capacity = calculate_needed_slots(max_capacity)?;
         let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
-        let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
+        let fp_rate = fp_rate.clamp(MIN_FP_RATE, 0.5);
         let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr(qbits.try_into().unwrap(), rbits.try_into().unwrap())?;
         if max_qbits > qbits {
@@ -1575,7 +1580,7 @@ impl<S: Clone> Filter<Box<[u8]>, S> {
         let qbits = slots_for_capacity.trailing_zeros() as u8;
         let slots_for_max_capacity = calculate_needed_slots(max_capacity)?;
         let max_qbits = slots_for_max_capacity.trailing_zeros() as u8;
-        let fp_rate = fp_rate.clamp(f64::MIN_POSITIVE, 0.5);
+        let fp_rate = fp_rate.clamp(MIN_FP_RATE, 0.5);
         let rbits = (-fp_rate.log2()).ceil().max(1.0) as u8 + (max_qbits - qbits);
         let mut result = Self::with_qr_and_hasher(
             qbits.try_into().unwrap(),
@@ -3501,5 +3506,29 @@ mod tests {
                 97, 108, 4, 97, 113, 7, 97, 114, 7, 97, 109, 246
             ]
         );
+    }
+
+    #[test]
+    fn extreme_fp_rate_does_not_overflow() {
+        // Regression for #25: a tiny `fp_rate` (0.0, f64::MIN_POSITIVE, or any
+        // negative value) used to overflow the u8 fingerprint-bit arithmetic and
+        // panic. Every constructor must instead return NotEnoughFingerprintBits.
+        for &fp in &[0.0, f64::MIN_POSITIVE, -1.0] {
+            assert!(matches!(
+                Filter::new(1000, fp),
+                Err(Error::NotEnoughFingerprintBits)
+            ));
+            assert!(matches!(
+                Filter::new_resizeable(1000, 1_000_000, fp),
+                Err(Error::NotEnoughFingerprintBits)
+            ));
+            assert!(matches!(
+                filter_specs(1000, fp),
+                Err(Error::NotEnoughFingerprintBits)
+            ));
+        }
+        // Valid rates are unaffected, and the clamp bound is exactly 2^-64.
+        assert!(Filter::new(1000, 0.01).is_ok());
+        assert_eq!(MIN_FP_RATE, 2f64.powi(-64));
     }
 }
