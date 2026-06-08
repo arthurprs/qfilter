@@ -1402,10 +1402,11 @@ impl<S: Clone> Builder<S> {
 /// Effectively, the largest power of 2 that can be multiplied by 19 without overflowing u64.
 const MAX_QBITS: u8 = 59;
 
-/// Smallest representable false positive rate (2^-64). A lower rate would imply more
-/// than 64 fingerprint bits, which can't be addressed and would overflow the `u8` bit
-/// counts; such requests return [`Error::NotEnoughFingerprintBits`] instead of panicking.
-const MIN_FP_RATE: f64 = 1.0 / (1u64 << 63) as f64 / 2.0;
+/// Smallest fp_rate the constructors accept. 2^-64 is the largest addressable
+/// fingerprint width (64 bits); clamping here keeps the `as u8` bit-count arithmetic
+/// from wrapping, so smaller rates return [`Error::NotEnoughFingerprintBits`] via the
+/// existing `fingerprint_bits > 64` check instead of panicking.
+const MIN_FP_RATE: f64 = 1.0 / (1u128 << 64) as f64;
 
 impl<B, S> Filter<B, S> {
     /// Maximum number of items that can be stored in the filter: ceil(2^59 * 19 / 20)
